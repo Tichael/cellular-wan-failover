@@ -1,0 +1,33 @@
+{
+    "name": "Cellular WAN Failover",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "forwardPorts": [
+        8989,
+        8990,
+        1080,
+        51820
+    ],
+    "mounts": [
+        "source=wan-failover-gradle-cache,target=/home/vscode/.gradle,type=volume"
+    ],
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "fwcd.kotlin",
+                "vscjava.vscode-gradle",
+                "ms-python.python",
+                "streetsidesoftware.code-spell-checker",
+                "vivaxy.vscode-conventional-commits",
+                "dotenv.dotenv-vscode",
+                "EditorConfig.EditorConfig",
+                "chneau.resource-monitor",
+                "FanaticPythoner.better-todo-tree",
+                "mk12.better-git-line-blame"
+            ]
+        }
+    },
+    "remoteUser": "vscode"
+}

@@ -1,0 +1,24 @@
+services:
+  wan-failover-gateway:
+    build: .
+    image: mobile-wan-gateway:latest
+    container_name: wan-failover-gateway
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - PRIMARY_IFACE=eth0
+      - FAILOVER_IFACE=eth1
+      - WG_IFACE=wg0
+      - PHONE_IP=                  # Leave empty to enable UDP auto-discovery (port 8990)
+      - HTTP_PORT=8989
+      - DISCOVERY_PORT=8990
+      - PING_TARGETS=1.1.1.1 8.8.8.8
+      - FAIL_THRESHOLD=3
+      - RESTORE_THRESHOLD=5
+      - CHECK_INTERVAL=5
+    volumes:
+      - ./dnsmasq.conf:/etc/dnsmasq.conf:ro
+      - /lib/modules:/lib/modules:ro
