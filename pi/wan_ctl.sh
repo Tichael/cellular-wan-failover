@@ -63,6 +63,15 @@ case "$ACTION" in
         ping -I "$PRIMARY_IFACE" -c 3 -W 2 1.1.1.1 || echo "Ping failed via $PRIMARY_IFACE"
         ;;
 
+    test-route)
+        echo "=== Testing WAN egress path via $PRIMARY_IFACE (Canary probe) ==="
+        if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -q "wan-failover-gateway"; then
+            docker exec -it wan-failover-gateway python3 /app/watchdog.py --test-route --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
+        else
+            python3 "$SCRIPT_DIR/watchdog.py" --test-route --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
+        fi
+        ;;
+
     docker-build)
         echo "=== Building Docker image mobile-wan-gateway ==="
         docker build -t mobile-wan-gateway:latest "$SCRIPT_DIR"
@@ -90,6 +99,7 @@ case "$ACTION" in
         echo "  start [IP]         : Force immediate activation of WireGuard failover"
         echo "  stop [IP]          : Stop failover and restore normal state"
         echo "  test-probe         : Test ping probe via primary interface eth0"
+        echo "  test-route         : Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)"
         echo "  docker-build       : Build local Docker image"
         echo "  docker-run         : Run container in background with docker run"
         exit 1

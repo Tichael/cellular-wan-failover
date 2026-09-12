@@ -9,7 +9,6 @@ import argparse
 import json
 import logging
 import os
-import re
 import select
 import signal
 import socket
@@ -231,7 +230,7 @@ class RoutingManager:
         """Removes iptables rules and dedicated routing rule."""
         logger.info(f"Cleaning up iptables rules and removing dedicated route (Table {self.table_id})...")
 
-        # 1. Remove iptables rules
+        # 1. Remove iptables forwarding & NAT rules
         self._run(["iptables", "-D", "FORWARD", "-i", self.failover_iface, "-o", self.wg_iface, "-j", "ACCEPT"])
         self._run(["iptables", "-D", "FORWARD", "-i", self.wg_iface, "-o", self.failover_iface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
         self._run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-o", self.wg_iface, "-j", "MASQUERADE"])
@@ -245,6 +244,23 @@ class RoutingManager:
         # 3. Flush routing table
         self._run(["ip", "route", "flush", "table", self.table_id])
         logger.info("Network cleanup complete.")
+
+
+def check_tunnel_canary(iface: str, canary_ip: str = "198.18.0.1", timeout: int = 2) -> bool:
+    """
+    Sends an ICMP Echo Request to a non-routable canary IP (RFC 2544 benchmark range).
+    Since the IP is non-routable on the internet, public ISPs drop it.
+    However, the Android WireGuard relay synthesizes ICMP Echo Replies for any packet
+    entering the tunnel. Thus, this returns True IF AND ONLY IF the router is currently
+    routing outbound LAN traffic through the backup WAN 2 gateway.
+    """
+    cmd = ["ping", "-I", iface, "-c", "1", "-W", str(timeout), canary_ip]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except Exception as e:
+        logger.debug(f"Canary probe error via {iface} to {canary_ip}: {e}")
+        return False
 
 
 def check_primary_wan(iface: str, targets: list[str], timeout: int = 2) -> bool:
@@ -263,17 +279,20 @@ def check_primary_wan(iface: str, targets: list[str], timeout: int = 2) -> bool:
 def main():
     parser = argparse.ArgumentParser(description="Cellular WAN Failover Daemon (Raspberry Pi <-> Android)")
     parser.add_argument("--primary-iface", default=os.environ.get("PRIMARY_IFACE", "eth0"), help="Primary WAN 1 interface connected to LAN (default: eth0)")
-    parser.add_argument("--failover-iface", default=os.environ.get("FAILOVER_IFACE", "eth1"), help="Failover WAN 2 interface connected to UniFi (default: eth1)")
+    parser.add_argument("--failover-iface", default=os.environ.get("FAILOVER_IFACE", "eth1"), help="Failover WAN 2 interface connected to router (default: eth1)")
+    parser.add_argument("--failover-gateway", default=os.environ.get("FAILOVER_GATEWAY", "192.168.100.1"), help="IP address of failover gateway on failover interface (default: 192.168.100.1)")
     parser.add_argument("--wg-iface", default=os.environ.get("WG_IFACE", "wg0"), help="WireGuard interface name (default: wg0)")
     parser.add_argument("--phone-ip", default=os.environ.get("PHONE_IP"), help="Static Wi-Fi IP of smartphone (optional if using UDP discovery)")
     parser.add_argument("--http-port", type=int, default=int(os.environ.get("HTTP_PORT", 8989)), help="Smartphone HTTP API port (default: 8989)")
     parser.add_argument("--discovery-port", type=int, default=int(os.environ.get("DISCOVERY_PORT", 8990)), help="UDP discovery port (default: 8990)")
     parser.add_argument("--targets", nargs="+", default=os.environ.get("PING_TARGETS", "1.1.1.1 8.8.8.8").split(), help="Ping target addresses")
+    parser.add_argument("--canary-ip", default=os.environ.get("CANARY_IP", "198.18.0.1"), help="Non-routable RFC 2544 canary IP synthesized only by tunnel (default: 198.18.0.1)")
     parser.add_argument("--fail-threshold", type=int, default=int(os.environ.get("FAIL_THRESHOLD", 3)), help="Consecutive failures before failover")
     parser.add_argument("--restore-threshold", type=int, default=int(os.environ.get("RESTORE_THRESHOLD", 5)), help="Consecutive successes before failback")
     parser.add_argument("--check-interval", type=int, default=int(os.environ.get("CHECK_INTERVAL", 5)), help="Health check interval in seconds")
     parser.add_argument("--discover-only", action="store_true", help="Print discovered smartphone IP and exit")
     parser.add_argument("--status-only", action="store_true", help="Print smartphone status and exit")
+    parser.add_argument("--test-route", action="store_true", help="Test if current outbound traffic from primary interface is hairpinned through WAN 2")
     parser.add_argument("--start-now", action="store_true", help="Force immediate failover activation and exit")
     parser.add_argument("--stop-now", action="store_true", help="Force immediate failover teardown and exit")
     args = parser.parse_args()
@@ -315,6 +334,25 @@ def main():
         discovery.stop()
         return
 
+    if args.test_route:
+        wan_ok = check_primary_wan(args.primary_iface, args.targets)
+        canary_ok = check_tunnel_canary(args.primary_iface, args.canary_ip)
+        print("=== WAN Egress Route Verification ===")
+        print(f"  - Primary interface  : {args.primary_iface}")
+        print(f"  - Failover interface : {args.failover_iface} (Gateway: {args.failover_gateway})")
+        print(f"  - Probe targets      : {', '.join(args.targets)}")
+        print(f"  - Canary target      : {args.canary_ip} (RFC 2544 benchmark)")
+        print(f"  - Internet reachable : {'YES' if wan_ok else 'NO'}")
+        print(f"  - Tunnel canary      : {'RESPONDED (via WAN 2 tunnel)' if canary_ok else 'TIMEOUT / UNREACHABLE'}")
+        if canary_ok:
+            print("  - Active egress path : WAN 2 (Hairpinned/routed via mobile cellular relay)")
+        elif wan_ok:
+            print("  - Active egress path : WAN 1 (Direct via primary WAN)")
+        else:
+            print("  - Active egress path : UNKNOWN / OFFLINE (Both primary and canary unreachable)")
+        discovery.stop()
+        return
+
     if args.start_now:
         client = get_client()
         cfg = client.get_wireguard_config()
@@ -353,9 +391,10 @@ def main():
     logger.info("====================================================================")
     logger.info("Starting WAN Failover Watchdog")
     logger.info(f"  - Primary interface (WAN 1)  : {args.primary_iface}")
-    logger.info(f"  - Failover interface (UniFi) : {args.failover_iface}")
+    logger.info(f"  - Failover interface (WAN 2) : {args.failover_iface} ({args.failover_gateway})")
     logger.info(f"  - WireGuard interface        : {args.wg_iface}")
     logger.info(f"  - ICMP probe targets         : {', '.join(args.targets)}")
+    logger.info(f"  - Non-routable canary IP     : {args.canary_ip}")
     logger.info(f"  - Fail / restore thresholds  : {args.fail_threshold} failures / {args.restore_threshold} successes")
     logger.info(f"  - Health check interval      : {args.check_interval}s")
     logger.info("====================================================================")
@@ -371,65 +410,89 @@ def main():
 
     try:
         while running:
-            wan_ok = check_primary_wan(args.primary_iface, args.targets)
+            if failover_active:
+                # While failover is active, test the non-routable canary IP (198.18.0.1).
+                # If the router is still routing LAN default traffic through WAN 2,
+                # the canary probe reaches eth1 -> wg0 and is answered by the phone's relay.
+                is_wan2_active = check_tunnel_canary(args.primary_iface, args.canary_ip)
+                if is_wan2_active:
+                    success_probes = 0
+                    logger.info(
+                        f"WAN 2 active: LAN traffic routed via backup cellular ({args.failover_iface}). "
+                        f"Standby for primary WAN recovery..."
+                    )
+                else:
+                    # Canary timed out! Outbound traffic is no longer going out WAN 2.
+                    # Verify if primary WAN 1 is healthy and passing traffic to public targets.
+                    wan1_ok = check_primary_wan(args.primary_iface, args.targets)
+                    if wan1_ok:
+                        success_probes += 1
+                        logger.info(
+                            f"WAN 1 probe ({args.primary_iface}): Direct via Primary "
+                            f"({success_probes}/{args.restore_threshold})"
+                        )
+                        if success_probes >= args.restore_threshold:
+                            logger.info(">>> WAN 1 recovery confirmed! Tearing down cellular failover... <<<")
+                            current_phone_ip = discovery.get_phone_ip()
 
-            if not wan_ok:
-                failed_probes += 1
-                success_probes = 0
-                logger.warning(f"WAN 1 probe ({args.primary_iface}): FAILED ({failed_probes}/{args.fail_threshold})")
+                            # 1. Immediate NAT transit deactivation (router falls back to WAN 1 instantly)
+                            routing.disable_routing_and_nat()
 
-                if failed_probes >= args.fail_threshold and not failover_active:
-                    logger.error("!!! WAN 1 OUTAGE DETECTED !!! Activating cellular failover...")
-                    current_phone_ip = discovery.get_phone_ip()
-                    if not current_phone_ip:
-                        logger.error("Cannot activate failover: no smartphone reachable!")
+                            # 2. Tear down WireGuard tunnel
+                            routing.teardown_wireguard_interface()
+
+                            # 3. Release mobile cellular radio on smartphone
+                            if current_phone_ip:
+                                try:
+                                    client = AndroidFailoverClient(phone_ip=current_phone_ip, http_port=args.http_port)
+                                    res = client.stop_failover()
+                                    logger.info(f"Smartphone returned to standby: {res}")
+                                except Exception as e:
+                                    logger.warning(f"Error while putting smartphone to standby: {e}")
+
+                            failover_active = False
+                            success_probes = 0
+                            logger.info("Failback to WAN 1 completed successfully.")
                     else:
-                        client = AndroidFailoverClient(phone_ip=current_phone_ip, http_port=args.http_port)
-                        try:
-                            # 1. Fetch WireGuard configuration
-                            wg_cfg = client.get_wireguard_config()
-
-                            # 2. Command smartphone to activate cellular and WireGuard
-                            res = client.start_failover()
-                            logger.info(f"Smartphone wake response: {res}")
-
-                            # 3. Bring up local WireGuard interface wg0
-                            routing.setup_wireguard_interface(wg_cfg)
-
-                            # 4. Activate dedicated routing eth1 -> wg0 and MASQUERADE
-                            routing.enable_routing_and_nat()
-
-                            failover_active = True
-                            logger.info(">>> Cellular WAN 2 Failover 100% OPERATIONAL. UniFi routes traffic via smartphone. <<<")
-                        except Exception as e:
-                            logger.error(f"Error during failover activation: {e}")
+                        success_probes = 0
+                        logger.warning(
+                            f"WAN probe failed: router left WAN 2, but primary WAN ({args.primary_iface}) still unreachable"
+                        )
             else:
-                success_probes += 1
-                failed_probes = 0
+                wan_ok = check_primary_wan(args.primary_iface, args.targets)
+                if not wan_ok:
+                    failed_probes += 1
+                    success_probes = 0
+                    logger.warning(f"WAN 1 probe ({args.primary_iface}): FAILED ({failed_probes}/{args.fail_threshold})")
 
-                if failover_active:
-                    logger.info(f"WAN 1 probe ({args.primary_iface}): SUCCESS ({success_probes}/{args.restore_threshold})")
-                    if success_probes >= args.restore_threshold:
-                        logger.info(">>> WAN 1 recovery confirmed! Tearing down cellular failover... <<<")
+                    if failed_probes >= args.fail_threshold:
+                        logger.error("!!! WAN 1 OUTAGE DETECTED !!! Activating cellular failover...")
                         current_phone_ip = discovery.get_phone_ip()
-
-                        # 1. Immediate NAT transit deactivation (UniFi falls back to WAN 1 instantly)
-                        routing.disable_routing_and_nat()
-
-                        # 2. Tear down WireGuard tunnel
-                        routing.teardown_wireguard_interface()
-
-                        # 3. Release mobile cellular radio on smartphone
-                        if current_phone_ip:
+                        if not current_phone_ip:
+                            logger.error("Cannot activate failover: no smartphone reachable!")
+                        else:
+                            client = AndroidFailoverClient(phone_ip=current_phone_ip, http_port=args.http_port)
                             try:
-                                client = AndroidFailoverClient(phone_ip=current_phone_ip, http_port=args.http_port)
-                                res = client.stop_failover()
-                                logger.info(f"Smartphone returned to standby: {res}")
-                            except Exception as e:
-                                logger.warning(f"Error while putting smartphone to standby: {e}")
+                                # 1. Fetch WireGuard configuration
+                                wg_cfg = client.get_wireguard_config()
 
-                        failover_active = False
-                        logger.info("Failback to WAN 1 completed successfully.")
+                                # 2. Command smartphone to activate cellular and WireGuard
+                                res = client.start_failover()
+                                logger.info(f"Smartphone wake response: {res}")
+
+                                # 3. Bring up local WireGuard interface wg0
+                                routing.setup_wireguard_interface(wg_cfg)
+
+                                # 4. Activate dedicated routing eth1 -> wg0 and MASQUERADE
+                                routing.enable_routing_and_nat()
+
+                                failover_active = True
+                                failed_probes = 0
+                                logger.info(">>> Cellular WAN 2 Failover 100% OPERATIONAL. Router routes traffic via smartphone. <<<")
+                            except Exception as e:
+                                logger.error(f"Error during failover activation: {e}")
+                else:
+                    failed_probes = 0
 
             time.sleep(args.check_interval)
 

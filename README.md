@@ -128,6 +128,9 @@ On the Raspberry Pi, use [`wan_ctl.sh`](pi/wan_ctl.sh):
 # Test WAN 1 primary probe connectivity (eth0)
 ./wan_ctl.sh test-probe
 
+# Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)
+./wan_ctl.sh test-route
+
 # Tail watchdog container logs in real time
 docker logs -f wan-failover-gateway
 ```
@@ -138,6 +141,6 @@ docker logs -f wan-failover-gateway
 
 1. **Continuous Monitoring** : The watchdog continuously monitors WAN 1 (`eth0`) using periodic ICMP pings to `1.1.1.1` and `8.8.8.8`.
 2. **Outage Detection** : Upon 3 consecutive ping failures, the watchdog invokes the phone's local HTTP API (`POST /v1/failover/start`).
-3. **Instant Failover** : The phone activates cellular data and starts its userspace WireGuard relay. The Pi brings up `wg0`, sets up Table 100 policy routing, and configures iptables MASQUERADE. UniFi detects WAN 2 healthy and routes all LAN traffic through it.
-4. **Automatic Recovery (Failback)** : As soon as WAN 1 responds with 5 consecutive successful pings, the Pi tears down `wg0`, flushes routing tables (UniFi switches back to WAN 1), and signals the phone to release cellular data (`POST /v1/failover/stop`).
+3. **Instant Failover** : The phone activates cellular data and starts its userspace WireGuard relay. The Pi brings up `wg0`, sets up Table 100 policy routing, and configures iptables MASQUERADE. The router detects WAN 2 healthy and routes all LAN traffic through it.
+4. **Tunnel Canary Verification & Automatic Recovery (Failback)** : While failover is active, the watchdog probes a non-routable benchmark IP (`198.18.0.1`, RFC 2544 / RFC 6890). If LAN default traffic is routed out WAN 2, the phone's WireGuard relay synthesizes replies and the canary succeeds, keeping failover active without flapping. Once primary WAN 1 recovers and the router switches its default route back to WAN 1, the canary times out (ISPs drop `198.18.0.1`). The watchdog then verifies direct internet connectivity via primary WAN 1 (`1.1.1.1`). After 5 consecutive direct successes, the Pi tears down `wg0`, flushes routing tables, and signals the phone to release cellular data (`POST /v1/failover/stop`).
 

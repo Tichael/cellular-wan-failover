@@ -105,11 +105,15 @@ docker run -d \
      iptables -A FORWARD -i wg0 -o eth1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
      iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
      ```
-   - UniFi detects WAN 2 online and routes local network traffic through it.
-5. **Failback Recovery (after 5 consecutive successes on `eth0`)** :
-   - Immediately tears down iptables and Table 100 rules (UniFi switches back to WAN 1 instantly).
-   - Tears down `wg0`.
-   - Calls `POST http://<phone_ip>:8989/v1/failover/stop` to release mobile radio and conserve phone battery.
+   - Router detects WAN 2 online and routes local network traffic through it.
+5. **Tunnel Canary Verification & Failback Recovery** :
+   - While failover is active, the watchdog probes a non-routable benchmark IP (`198.18.0.1`, RFC 2544 / RFC 6890) via `eth0`.
+   - **Why this is completely router-agnostic and avoids fragile iptables manipulation**:
+     - `198.18.0.1` is reserved for benchmarking and is not routable on the public internet (ISPs drop it).
+     - However, the smartphone's userspace WireGuard relay synthesizes ICMP Echo Replies for all ICMP requests entering the tunnel.
+     - **If the router routes traffic via WAN 2**: `198.18.0.1` is forwarded through WAN 2 -> `wg0` -> phone replies -> canary probe succeeds. The watchdog knows LAN traffic is still hairpinned through cellular backup and remains in failover standby.
+     - **If the router switches back to WAN 1**: `198.18.0.1` is sent out WAN 1 and dropped by the ISP -> canary probe times out! The watchdog now tests public targets (`1.1.1.1`, `8.8.8.8`) via `eth0`.
+   - After 5 consecutive direct successes on WAN 1, the Pi cleanly tears down iptables NAT rules, drops `wg0`, and signals the smartphone (`POST /v1/failover/stop`) to return cellular to low-power standby.
 
 ---
 
@@ -131,6 +135,9 @@ chmod +x wan_ctl.sh
 
 # Test primary WAN 1 probe via eth0
 ./wan_ctl.sh test-probe
+
+# Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)
+./wan_ctl.sh test-route
 
 # Stop failover and return to standby
 ./wan_ctl.sh stop
