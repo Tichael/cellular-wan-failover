@@ -34,9 +34,9 @@ case "$ACTION" in
         if command -v docker >/dev/null 2>&1 && docker ps --format '{{.Names}}' | grep -q "wan-failover-gateway"; then
             echo "=== Executing action $ACTION inside wan-failover-gateway container ==="
             if [ -z "$PHONE_IP" ]; then
-                docker exec -it wan-failover-gateway python3 /app/watchdog.py --${ACTION}-now --http-port "$HTTP_PORT" --discovery-port "$DISCOVERY_PORT" --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
+                docker exec -it wan-failover-gateway python3 /app/watchdog.py --"${ACTION}"-now --http-port "$HTTP_PORT" --discovery-port "$DISCOVERY_PORT" --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
             else
-                docker exec -it wan-failover-gateway python3 /app/watchdog.py --${ACTION}-now --phone-ip "$PHONE_IP" --http-port "$HTTP_PORT" --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
+                docker exec -it wan-failover-gateway python3 /app/watchdog.py --"${ACTION}"-now --phone-ip "$PHONE_IP" --http-port "$HTTP_PORT" --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
             fi
         else
             # Direct execution on host (requires wireguard-tools)
@@ -51,9 +51,9 @@ case "$ACTION" in
                 SUDO_CMD="sudo"
             fi
             if [ -z "$PHONE_IP" ]; then
-                $SUDO_CMD python3 "$SCRIPT_DIR/watchdog.py" --${ACTION}-now --http-port "$HTTP_PORT" --discovery-port "$DISCOVERY_PORT" --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
+                $SUDO_CMD python3 "$SCRIPT_DIR/watchdog.py" --"${ACTION}"-now --http-port "$HTTP_PORT" --discovery-port "$DISCOVERY_PORT" --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
             else
-                $SUDO_CMD python3 "$SCRIPT_DIR/watchdog.py" --${ACTION}-now --phone-ip "$PHONE_IP" --http-port "$HTTP_PORT" --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
+                $SUDO_CMD python3 "$SCRIPT_DIR/watchdog.py" --"${ACTION}"-now --phone-ip "$PHONE_IP" --http-port "$HTTP_PORT" --primary-iface "$PRIMARY_IFACE" --failover-iface "$FAILOVER_IFACE"
             fi
         fi
         ;;

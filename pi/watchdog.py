@@ -72,7 +72,7 @@ class PhoneDiscovery:
     def __init__(self, port: int = 8990, initial_ip: str | None = None):
         self.port = port
         self.phone_ip = initial_ip
-        self.device_info = {}
+        self.device_info: dict[str, object] = {}
         self._running = False
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -276,26 +276,34 @@ def check_primary_wan(iface: str, targets: list[str], timeout: int = 2) -> bool:
     return False
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Cellular WAN Failover Daemon (Raspberry Pi <-> Android)")
     parser.add_argument("--primary-iface", default=os.environ.get("PRIMARY_IFACE", "eth0"), help="Primary WAN 1 interface connected to LAN (default: eth0)")
     parser.add_argument("--failover-iface", default=os.environ.get("FAILOVER_IFACE", "eth1"), help="Failover WAN 2 interface connected to router (default: eth1)")
     parser.add_argument("--failover-gateway", default=os.environ.get("FAILOVER_GATEWAY", "192.168.100.1"), help="IP address of failover gateway on failover interface (default: 192.168.100.1)")
     parser.add_argument("--wg-iface", default=os.environ.get("WG_IFACE", "wg0"), help="WireGuard interface name (default: wg0)")
     parser.add_argument("--phone-ip", default=os.environ.get("PHONE_IP"), help="Static Wi-Fi IP of smartphone (optional if using UDP discovery)")
-    parser.add_argument("--http-port", type=int, default=int(os.environ.get("HTTP_PORT", 8989)), help="Smartphone HTTP API port (default: 8989)")
-    parser.add_argument("--discovery-port", type=int, default=int(os.environ.get("DISCOVERY_PORT", 8990)), help="UDP discovery port (default: 8990)")
+    parser.add_argument("--http-port", type=int, default=int(os.environ.get("HTTP_PORT", "8989")), help="Smartphone HTTP API port (default: 8989)")
+    parser.add_argument("--discovery-port", type=int, default=int(os.environ.get("DISCOVERY_PORT", "8990")), help="UDP discovery port (default: 8990)")
     parser.add_argument("--targets", nargs="+", default=os.environ.get("PING_TARGETS", "1.1.1.1 8.8.8.8").split(), help="Ping target addresses")
     parser.add_argument("--canary-ip", default=os.environ.get("CANARY_IP", "198.18.0.1"), help="Non-routable RFC 2544 canary IP synthesized only by tunnel (default: 198.18.0.1)")
-    parser.add_argument("--fail-threshold", type=int, default=int(os.environ.get("FAIL_THRESHOLD", 3)), help="Consecutive failures before failover")
-    parser.add_argument("--restore-threshold", type=int, default=int(os.environ.get("RESTORE_THRESHOLD", 5)), help="Consecutive successes before failback")
-    parser.add_argument("--check-interval", type=int, default=int(os.environ.get("CHECK_INTERVAL", 5)), help="Health check interval in seconds")
+    parser.add_argument("--fail-threshold", type=int, default=int(os.environ.get("FAIL_THRESHOLD", "3")), help="Consecutive failures before failover")
+    parser.add_argument("--restore-threshold", type=int, default=int(os.environ.get("RESTORE_THRESHOLD", "5")), help="Consecutive successes before failback")
+    parser.add_argument("--check-interval", type=int, default=int(os.environ.get("CHECK_INTERVAL", "5")), help="Health check interval in seconds")
     parser.add_argument("--discover-only", action="store_true", help="Print discovered smartphone IP and exit")
     parser.add_argument("--status-only", action="store_true", help="Print smartphone status and exit")
     parser.add_argument("--test-route", action="store_true", help="Test if current outbound traffic from primary interface is hairpinned through WAN 2")
     parser.add_argument("--start-now", action="store_true", help="Force immediate failover activation and exit")
     parser.add_argument("--stop-now", action="store_true", help="Force immediate failover teardown and exit")
-    args = parser.parse_args()
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+def main():
+    args = parse_args()
 
     discovery = PhoneDiscovery(port=args.discovery_port, initial_ip=args.phone_ip)
     discovery.start()

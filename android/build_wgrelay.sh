@@ -10,9 +10,9 @@ if [ -z "${ANDROID_NDK_HOME:-}" ]; then
     if [ -n "${ANDROID_NDK_ROOT:-}" ]; then
         ANDROID_NDK_HOME="${ANDROID_NDK_ROOT}"
     elif [ -n "${ANDROID_HOME:-}" ] && [ -d "${ANDROID_HOME}/ndk" ]; then
-        ANDROID_NDK_HOME="$(ls -td "${ANDROID_HOME}/ndk"/* 2>/dev/null | head -n 1)"
+        ANDROID_NDK_HOME="$(find "${ANDROID_HOME}/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)"
     elif [ -d "/home/vscode/android-sdk/ndk" ]; then
-        ANDROID_NDK_HOME="$(ls -td /home/vscode/android-sdk/ndk/* 2>/dev/null | head -n 1)"
+        ANDROID_NDK_HOME="$(find "/home/vscode/android-sdk/ndk" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -V | tail -n 1)"
     fi
 fi
 
