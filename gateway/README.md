@@ -51,10 +51,10 @@ The gateway runs as a self-contained, lightweight Alpine Docker container.
 
 ### Method 1: Launch with `docker-compose` (Recommended)
 ```bash
-cd /path/to/pi
+cd /path/to/gateway
 
-# Build the image and start in the background
-docker compose up -d --build
+# Pull the prebuilt image (or build locally with --build) and start in the background
+docker compose up -d
 
 # Follow logs in real time
 docker compose logs -f
@@ -62,8 +62,8 @@ docker compose logs -f
 
 ### Method 2: Direct Execution with `docker run`
 ```bash
-# 1. Build local image
-docker build -t mobile-wan-gateway:latest .
+# 1. Pull prebuilt image
+docker pull ghcr.io/tichael/cellular-wan-gateway:latest
 
 # 2. Run container
 docker run -d \
@@ -74,7 +74,7 @@ docker run -d \
   --cap-add NET_RAW \
   -v "$(pwd)/dnsmasq.conf:/etc/dnsmasq.conf:ro" \
   -v /lib/modules:/lib/modules:ro \
-  mobile-wan-gateway:latest
+  ghcr.io/tichael/cellular-wan-gateway:latest
 ```
 
 ---

@@ -52,7 +52,7 @@ mobile-wan-backup/
 │   ├── app/                   # Kotlin app (Ktor HTTP :8989, Discovery :8990, Compose UI)
 │   ├── wgrelay/               # Userspace WireGuard relay in Go (gVisor, DNAT/SNAT, NDK bind)
 │   └── build_wgrelay.sh       # NDK arm64 build script (16 KB page alignment)
-└── pi/                        # All-in-one Raspberry Pi gateway under Docker
+└── gateway/                   # All-in-one failover gateway under Docker
     ├── Dockerfile             # Alpine image (dnsmasq, wireguard-tools, iptables, python3)
     ├── docker-compose.yml     # Docker host service with cap_add NET_ADMIN
     ├── dnsmasq.conf           # Isolated DHCP configuration on eth1 (192.168.100.1)
@@ -93,13 +93,13 @@ mobile-wan-backup/
    * Open the app on the phone. The *Foreground Service* starts with an ongoing persistent notification.
    * In Android settings for the app, set Battery usage to **Unrestricted**.
 
-### Step 2: Raspberry Pi Gateway (`pi/`)
+### Step 2: Gateway Deployment (`gateway/`)
 
-1. **Copy `pi/` directory** to the Raspberry Pi (e.g. `~/wan-failover`).
-2. **Build and start Docker container** :
+1. **Copy `gateway/` directory** to the Raspberry Pi or gateway host (e.g. `~/wan-failover`).
+2. **Pull image and start Docker container** (or build locally with `--build`):
    ```bash
    cd ~/wan-failover
-   docker compose up -d --build
+   docker compose up -d
    ```
 3. **Verify status** :
    ```bash
@@ -110,7 +110,7 @@ mobile-wan-backup/
 
 ## 5. Operations & CLI Utility (`wan_ctl.sh`)
 
-On the Raspberry Pi, use [`wan_ctl.sh`](pi/wan_ctl.sh):
+On the gateway host, use [`wan_ctl.sh`](gateway/wan_ctl.sh):
 
 ```bash
 # Check smartphone status, relay state, and transmitted bytes
