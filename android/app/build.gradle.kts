@@ -9,12 +9,15 @@ android {
     namespace = "com.example.cellularwanfailover"
     compileSdk = 35
 
+    val appVersionName = project.findProperty("versionName") as? String ?: "0.1.0"
+    val appVersionCode = (project.findProperty("versionCode") as? String)?.toIntOrNull() ?: 100
+
     defaultConfig {
         applicationId = "com.example.cellularwanfailover"
         minSdk = 28
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = appVersionCode
+        versionName = appVersionName
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -75,7 +78,7 @@ dependencies {
     // 16 KB page size alignment fix for Android 15
     implementation("androidx.graphics:graphics-path:1.1.0")
 
-    // Ktor embedded HTTP server for Pi control API
+    // Ktor embedded HTTP server for Gateway control API
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.cio)
     implementation(libs.ktor.server.content.negotiation)

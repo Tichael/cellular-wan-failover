@@ -3,6 +3,12 @@
 *.aar
 *.aab
 
+# Keystores and signing credentials
+*.jks
+*.keystore
+keystore_base64.txt
+release.keystore
+
 # Gradle files
 .gradle/
 build/

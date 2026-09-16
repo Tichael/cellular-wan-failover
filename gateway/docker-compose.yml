@@ -1,7 +1,7 @@
 services:
   wan-failover-gateway:
     build: .
-    image: mobile-wan-gateway:latest
+    image: ghcr.io/tichael/cellular-wan-gateway:latest
     container_name: wan-failover-gateway
     restart: unless-stopped
     network_mode: host
