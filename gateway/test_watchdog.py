@@ -170,6 +170,41 @@ class TestRoutingManager:
         assert "DNS" not in written_content
         assert "Table = off" in written_content
 
+    @patch("subprocess.run")
+    def test_enable_routing_and_nat_with_clamp_mss(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        manager = RoutingManager(failover_iface="eth1", wg_iface="wg0", table_id=105, clamp_mss=True)
+        manager.enable_routing_and_nat()
+
+        cmds = [call[0][0] for call in mock_run.call_args_list]
+        # Check table_id used in route and rule
+        assert ["ip", "route", "replace", "default", "dev", "wg0", "table", "105"] in cmds
+        assert ["ip", "rule", "add", "iif", "eth1", "table", "105"] in cmds
+        # Check TCP MSS rule check and add
+        assert ["iptables", "-t", "mangle", "-C", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"] in cmds
+        assert ["iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"] in cmds
+
+    @patch("subprocess.run")
+    def test_enable_routing_and_nat_without_clamp_mss(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        manager = RoutingManager(failover_iface="eth1", wg_iface="wg0", table_id=105, clamp_mss=False)
+        manager.enable_routing_and_nat()
+
+        cmds = [call[0][0] for call in mock_run.call_args_list]
+        # Ensure TCPMSS is not called
+        for cmd in cmds:
+            assert "TCPMSS" not in cmd
+
+    @patch("subprocess.run")
+    def test_disable_routing_and_nat_with_clamp_mss(self, mock_run):
+        mock_run.return_value = MagicMock(returncode=1, stdout="")
+        manager = RoutingManager(failover_iface="eth1", wg_iface="wg0", table_id=105, clamp_mss=True)
+        manager.disable_routing_and_nat()
+
+        cmds = [call[0][0] for call in mock_run.call_args_list]
+        assert ["iptables", "-t", "mangle", "-D", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"] in cmds
+        assert ["ip", "route", "flush", "table", "105"] in cmds
+
 
 class TestArgParsing:
     def test_default_arguments(self):
@@ -178,6 +213,9 @@ class TestArgParsing:
         assert args.failover_iface == "eth1"
         assert args.failover_gateway == "192.168.100.1"
         assert args.wg_iface == "wg0"
+        assert args.table_id == 100
+        assert args.clamp_mss is True
+        assert args.ping_timeout == 2
         assert args.http_port == 8989
         assert args.discovery_port == 8990
         assert args.targets == ["1.1.1.1", "8.8.8.8"]
@@ -190,7 +228,10 @@ class TestArgParsing:
         args = parse_args([
             "--primary-iface", "enp1s0",
             "--failover-iface", "enp2s0",
-            "--failover-gateway", "192.168.200.1",
+            "--failover-gateway-ip", "192.168.200.1",
+            "--table-id", "200",
+            "--no-clamp-mss",
+            "--ping-timeout", "4",
             "--phone-ip", "10.0.0.123",
             "--http-port", "9090",
             "--discovery-port", "9091",
@@ -202,6 +243,9 @@ class TestArgParsing:
         assert args.primary_iface == "enp1s0"
         assert args.failover_iface == "enp2s0"
         assert args.failover_gateway == "192.168.200.1"
+        assert args.table_id == 200
+        assert args.clamp_mss is False
+        assert args.ping_timeout == 4
         assert args.phone_ip == "10.0.0.123"
         assert args.http_port == 9090
         assert args.discovery_port == 9091

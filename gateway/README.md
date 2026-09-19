@@ -1,6 +1,6 @@
-# Raspberry Pi WAN Failover Gateway (UniFi WAN 2 <-> Android WireGuard)
+# Cellular WAN Failover Gateway (UniFi WAN 2 <-> Android WireGuard)
 
-This component turns a Raspberry Pi running Debian 12 into an autonomous backup gateway for an **UniFi Cloud Gateway (UCG-Fiber)** console, relaying traffic over the 4G/5G mobile connection of a wireless Android smartphone.
+This component turns a Linux machine (Raspberry Pi, Mini PC, or Debian/Ubuntu server) into an autonomous backup gateway for an **UniFi Cloud Gateway (UCG-Fiber)** console, relaying traffic over the 4G/5G mobile connection of a wireless Android smartphone.
 
 ---
 
@@ -11,7 +11,7 @@ This component turns a Raspberry Pi running Debian 12 into an autonomous backup 
   ├── WAN 1 Port (Fiber) ───────> Fiber Internet (Primary)
   └── WAN 2 Port (Failover) ────> Direct Ethernet Cable ───> [ eth1: 192.168.100.1/24 ]
                                                                        │
-                                                              [ Raspberry Pi (Debian 12) ]
+                                                              [ Linux Gateway Host ]
                                                                        │
   ┌───────────────────────────────────────────────────────────────────┘
   │
@@ -25,10 +25,15 @@ This component turns a Raspberry Pi running Debian 12 into an autonomous backup 
 
 ---
 
-## 2. Raspberry Pi Host Prerequisites
+## 2. Host Prerequisites
 
-### Configuration of `eth1` (USB-Ethernet Adapter)
-Interface `eth1` must have a static IP with no default gateway. Using `NetworkManager`:
+### Configuration of `FAILOVER_IFACE` (e.g. `eth1`)
+By default, **the gateway container automatically manages the failover interface IP** (`AUTO_CONFIGURE_IFACE=true`).
+- The interface will be brought up and assigned `${FAILOVER_GATEWAY_IP}/${FAILOVER_CIDR}` (default: `192.168.100.1/24`).
+- **Fail-fast behavior**: If the interface already has an existing IPv4 address assigned on the host, the container will exit with an error to prevent silent conflicts.
+- If you prefer managing the interface manually on the host (e.g. via `NetworkManager` or `systemd-networkd`), set `AUTO_CONFIGURE_IFACE=false` in your `.env` file.
+
+Manual host configuration (optional, only needed if `AUTO_CONFIGURE_IFACE=false`):
 ```bash
 sudo nmcli con add type ethernet ifname eth1 con-name "WAN2-Link" \
   ipv4.method manual ipv4.addresses 192.168.100.1/24 \
@@ -49,15 +54,74 @@ sudo modprobe iptable_nat
 
 The gateway runs as a self-contained, lightweight Alpine Docker container.
 
-### Method 1: Launch with `docker-compose` (Recommended)
+### Configuration (`.env`)
+Copy the provided `.env.example` to `.env` and customize parameters if needed:
+```bash
+cp .env.example .env
+```
+
+### Method 1: Launch with `docker compose` (Recommended)
+
+#### Option A: Clone repository or copy `gateway/`
 ```bash
 cd /path/to/gateway
 
-# Pull the prebuilt image (or build locally with --build) and start in the background
+# 1. Customize configuration if needed
+cp .env.example .env
+
+# 2. Start container in background (use --build to build locally)
 docker compose up -d
 
-# Follow logs in real time
+# 3. Follow logs in real time
 docker compose logs -f
+```
+
+#### Option B: Standalone `compose.yaml` (No Git clone required)
+Save the following as `compose.yaml` in your homelab directory:
+
+```yaml
+services:
+  wan-failover-gateway:
+    image: ghcr.io/tichael/cellular-wan-gateway:latest
+    container_name: wan-failover-gateway
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      # Network interfaces
+      - PRIMARY_IFACE=eth0
+      - FAILOVER_IFACE=eth1
+      # Failover gateway IP & automatic interface configuration
+      - FAILOVER_GATEWAY_IP=192.168.100.1
+      - FAILOVER_CIDR=24
+      - FAILOVER_NETMASK=255.255.255.0
+      - AUTO_CONFIGURE_IFACE=true
+      # Internal DHCP server (dnsmasq)
+      - DHCP_ENABLED=true
+      - DHCP_RANGE_START=192.168.100.10
+      - DHCP_RANGE_END=192.168.100.20
+      - DHCP_LEASE_TIME=12h
+      - DNS_SERVERS=9.9.9.10,149.112.112.10
+      # Routing table & WireGuard
+      - ROUTING_TABLE_ID=100
+      - WG_IFACE=wg0
+      - CLAMP_MSS=true
+      # Health checks & thresholds
+      - PING_TARGETS=1.1.1.1 8.8.8.8
+      - PING_TIMEOUT=2
+      - CANARY_IP=198.18.0.1
+      - FAIL_THRESHOLD=3
+      - RESTORE_THRESHOLD=5
+      - CHECK_INTERVAL=5
+    volumes:
+      - /lib/modules:/lib/modules:ro
+```
+
+Run:
+```bash
+docker compose up -d
 ```
 
 ### Method 2: Direct Execution with `docker run`
@@ -65,14 +129,13 @@ docker compose logs -f
 # 1. Pull prebuilt image
 docker pull ghcr.io/tichael/cellular-wan-gateway:latest
 
-# 2. Run container
+# 2. Run container (uses default environment or pass custom -e flags / --env-file .env)
 docker run -d \
   --name wan-failover-gateway \
   --restart unless-stopped \
   --network host \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
-  -v "$(pwd)/dnsmasq.conf:/etc/dnsmasq.conf:ro" \
   -v /lib/modules:/lib/modules:ro \
   ghcr.io/tichael/cellular-wan-gateway:latest
 ```

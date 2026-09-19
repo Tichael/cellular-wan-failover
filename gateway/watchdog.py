@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Raspberry Pi WAN Failover Watchdog (WireGuard + Policy Routing)
+Cellular WAN Failover Watchdog (WireGuard + Policy Routing)
 Monitors WAN 1 (Fiber/Cable) connectivity via eth0 and automatically fails over
 to the Android cellular relay via WireGuard when an outage is detected.
 """
@@ -41,7 +41,7 @@ class AndroidFailoverClient:
 
     def _request(self, path: str, method: str = "GET", data: bytes | None = None, timeout: float | None = None) -> str:
         url = f"{self.base_url}{path}"
-        req = urllib.request.Request(url, data=data, headers={"User-Agent": "RPi-Watchdog/1.0"}, method=method)
+        req = urllib.request.Request(url, data=data, headers={"User-Agent": "Cellular-WAN-Gateway/1.0"}, method=method)
         t = timeout or self.timeout
         for attempt in range(3):
             try:
@@ -135,11 +135,11 @@ class PhoneDiscovery:
 class RoutingManager:
     """Manages WireGuard interface, dedicated routing table, and iptables rules."""
 
-    def __init__(self, primary_iface: str = "eth0", failover_iface: str = "eth1", wg_iface: str = "wg0", table_id: int = 100):
-        self.primary_iface = primary_iface
+    def __init__(self, failover_iface: str = "eth1", wg_iface: str = "wg0", table_id: int = 100, clamp_mss: bool = True):
         self.failover_iface = failover_iface
         self.wg_iface = wg_iface
         self.table_id = str(table_id)
+        self.clamp_mss = clamp_mss
 
     def _run(self, cmd: list[str], check: bool = False) -> subprocess.CompletedProcess:
         try:
@@ -224,24 +224,34 @@ class RoutingManager:
         if res.returncode != 0:
             self._run(["iptables", "-t", "nat", "-A", "POSTROUTING", "-o", self.wg_iface, "-j", "MASQUERADE"], check=True)
 
+        # 5. TCP MSS Clamping to PMTU (prevents packet drop/fragmentation over WireGuard)
+        if self.clamp_mss:
+            res = self._run(["iptables", "-t", "mangle", "-C", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"])
+            if res.returncode != 0:
+                self._run(["iptables", "-t", "mangle", "-A", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"], check=True)
+
         logger.info(f"Transit and NAT configured: {self.failover_iface} -> {self.wg_iface} -> Cellular.")
 
     def disable_routing_and_nat(self):
         """Removes iptables rules and dedicated routing rule."""
         logger.info(f"Cleaning up iptables rules and removing dedicated route (Table {self.table_id})...")
 
-        # 1. Remove iptables forwarding & NAT rules
+        # 1. Remove TCP MSS clamping rule if enabled
+        if self.clamp_mss:
+            self._run(["iptables", "-t", "mangle", "-D", "FORWARD", "-p", "tcp", "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--clamp-mss-to-pmtu"])
+
+        # 2. Remove iptables forwarding & NAT rules
         self._run(["iptables", "-D", "FORWARD", "-i", self.failover_iface, "-o", self.wg_iface, "-j", "ACCEPT"])
         self._run(["iptables", "-D", "FORWARD", "-i", self.wg_iface, "-o", self.failover_iface, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"])
         self._run(["iptables", "-t", "nat", "-D", "POSTROUTING", "-o", self.wg_iface, "-j", "MASQUERADE"])
 
-        # 2. Remove ip rule
+        # 3. Remove ip rule
         while True:
             res = self._run(["ip", "rule", "del", "iif", self.failover_iface, "table", self.table_id])
             if res.returncode != 0:
                 break
 
-        # 3. Flush routing table
+        # 4. Flush routing table
         self._run(["ip", "route", "flush", "table", self.table_id])
         logger.info("Network cleanup complete.")
 
@@ -277,15 +287,18 @@ def check_primary_wan(iface: str, targets: list[str], timeout: int = 2) -> bool:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Cellular WAN Failover Daemon (Raspberry Pi <-> Android)")
+    parser = argparse.ArgumentParser(description="Cellular WAN Failover Daemon (Linux Gateway <-> Android)")
     parser.add_argument("--primary-iface", default=os.environ.get("PRIMARY_IFACE", "eth0"), help="Primary WAN 1 interface connected to LAN (default: eth0)")
     parser.add_argument("--failover-iface", default=os.environ.get("FAILOVER_IFACE", "eth1"), help="Failover WAN 2 interface connected to router (default: eth1)")
-    parser.add_argument("--failover-gateway", default=os.environ.get("FAILOVER_GATEWAY", "192.168.100.1"), help="IP address of failover gateway on failover interface (default: 192.168.100.1)")
+    parser.add_argument("--failover-gateway-ip", "--failover-gateway", dest="failover_gateway", default=os.environ.get("FAILOVER_GATEWAY_IP", "192.168.100.1"), help="IP address of failover gateway on failover interface (default: 192.168.100.1)")
     parser.add_argument("--wg-iface", default=os.environ.get("WG_IFACE", "wg0"), help="WireGuard interface name (default: wg0)")
+    parser.add_argument("--table-id", type=int, default=int(os.environ.get("ROUTING_TABLE_ID", "100")), help="Policy routing table ID for failover traffic (default: 100)")
+    parser.add_argument("--clamp-mss", action=argparse.BooleanOptionalAction, default=os.environ.get("CLAMP_MSS", "true").lower() in ("true", "1", "yes"), help="Enable/disable TCP MSS clamping for WireGuard (default: enabled)")
     parser.add_argument("--phone-ip", default=os.environ.get("PHONE_IP"), help="Static Wi-Fi IP of smartphone (optional if using UDP discovery)")
     parser.add_argument("--http-port", type=int, default=int(os.environ.get("HTTP_PORT", "8989")), help="Smartphone HTTP API port (default: 8989)")
     parser.add_argument("--discovery-port", type=int, default=int(os.environ.get("DISCOVERY_PORT", "8990")), help="UDP discovery port (default: 8990)")
     parser.add_argument("--targets", nargs="+", default=os.environ.get("PING_TARGETS", "1.1.1.1 8.8.8.8").split(), help="Ping target addresses")
+    parser.add_argument("--ping-timeout", type=int, default=int(os.environ.get("PING_TIMEOUT", "2")), help="Timeout in seconds for ICMP ping probes (default: 2)")
     parser.add_argument("--canary-ip", default=os.environ.get("CANARY_IP", "198.18.0.1"), help="Non-routable RFC 2544 canary IP synthesized only by tunnel (default: 198.18.0.1)")
     parser.add_argument("--fail-threshold", type=int, default=int(os.environ.get("FAIL_THRESHOLD", "3")), help="Consecutive failures before failover")
     parser.add_argument("--restore-threshold", type=int, default=int(os.environ.get("RESTORE_THRESHOLD", "5")), help="Consecutive successes before failback")
@@ -309,10 +322,10 @@ def main():
     discovery.start()
 
     routing = RoutingManager(
-        primary_iface=args.primary_iface,
         failover_iface=args.failover_iface,
         wg_iface=args.wg_iface,
-        table_id=100
+        table_id=args.table_id,
+        clamp_mss=args.clamp_mss,
     )
 
     def get_client() -> AndroidFailoverClient:
@@ -343,8 +356,8 @@ def main():
         return
 
     if args.test_route:
-        wan_ok = check_primary_wan(args.primary_iface, args.targets)
-        canary_ok = check_tunnel_canary(args.primary_iface, args.canary_ip)
+        wan_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
+        canary_ok = check_tunnel_canary(args.primary_iface, args.canary_ip, timeout=args.ping_timeout)
         print("=== WAN Egress Route Verification ===")
         print(f"  - Primary interface  : {args.primary_iface}")
         print(f"  - Failover interface : {args.failover_iface} (Gateway: {args.failover_gateway})")
@@ -400,8 +413,10 @@ def main():
     logger.info("Starting WAN Failover Watchdog")
     logger.info(f"  - Primary interface (WAN 1)  : {args.primary_iface}")
     logger.info(f"  - Failover interface (WAN 2) : {args.failover_iface} ({args.failover_gateway})")
+    logger.info(f"  - Policy routing table ID    : {args.table_id}")
+    logger.info(f"  - TCP MSS clamping           : {'enabled' if args.clamp_mss else 'disabled'}")
     logger.info(f"  - WireGuard interface        : {args.wg_iface}")
-    logger.info(f"  - ICMP probe targets         : {', '.join(args.targets)}")
+    logger.info(f"  - ICMP probe targets         : {', '.join(args.targets)} (timeout: {args.ping_timeout}s)")
     logger.info(f"  - Non-routable canary IP     : {args.canary_ip}")
     logger.info(f"  - Fail / restore thresholds  : {args.fail_threshold} failures / {args.restore_threshold} successes")
     logger.info(f"  - Health check interval      : {args.check_interval}s")
@@ -422,7 +437,7 @@ def main():
                 # While failover is active, test the non-routable canary IP (198.18.0.1).
                 # If the router is still routing LAN default traffic through WAN 2,
                 # the canary probe reaches eth1 -> wg0 and is answered by the phone's relay.
-                is_wan2_active = check_tunnel_canary(args.primary_iface, args.canary_ip)
+                is_wan2_active = check_tunnel_canary(args.primary_iface, args.canary_ip, timeout=args.ping_timeout)
                 if is_wan2_active:
                     success_probes = 0
                     logger.info(
@@ -432,7 +447,7 @@ def main():
                 else:
                     # Canary timed out! Outbound traffic is no longer going out WAN 2.
                     # Verify if primary WAN 1 is healthy and passing traffic to public targets.
-                    wan1_ok = check_primary_wan(args.primary_iface, args.targets)
+                    wan1_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
                     if wan1_ok:
                         success_probes += 1
                         logger.info(
@@ -467,7 +482,7 @@ def main():
                             f"WAN probe failed: router left WAN 2, but primary WAN ({args.primary_iface}) still unreachable"
                         )
             else:
-                wan_ok = check_primary_wan(args.primary_iface, args.targets)
+                wan_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
                 if not wan_ok:
                     failed_probes += 1
                     success_probes = 0

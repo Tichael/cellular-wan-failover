@@ -12,7 +12,7 @@ flowchart LR
         UCG["UniFi Cloud Gateway\n(UCG-Fiber)"]
     end
 
-    subgraph Pi["Raspberry Pi (Docker wan-failover-gateway)"]
+    subgraph Gateway["Linux Gateway (Docker wan-failover-gateway)"]
         ETH1["eth1 (192.168.100.1)\ndnsmasq DHCP Server"]
         IPTABLES["iptables NAT & Table 100\n(Policy Routing)"]
         WG_CLIENT["wg0 (10.100.0.2)\nWireGuard Client"]
@@ -38,8 +38,8 @@ flowchart LR
 * **Zero SOCKS5 / tun2socks** : Pure WireGuard architecture end-to-end delivering optimal throughput and supporting IP, UDP (DNS), and ICMP (UniFi health check pings).
 * **Forced Cellular Outbound** : Outbound internet sockets are bound directly to the active cellular network handle using NDK `android_setsocknetwork(netHandle, fd)`. The smartphone remains connected to local Wi-Fi.
 * **Android 15 (ARM64) 16 KB Page-Size Compliant** : Native binary built with 16 KB ELF page alignment (`-Wl,-z,max-page-size=16384`) verified via `zipalign`.
-* **Power Efficiency** : During normal operation, cellular data and the WireGuard relay remain dormant (`idle`). They are awakened on-demand by the Raspberry Pi only when WAN 1 fails.
-* **Complete Host Isolation on Pi** : Everything runs inside an all-in-one Alpine Docker container using `--network host`. No packages installed on the host Debian OS.
+* **Power Efficiency** : During normal operation, cellular data and the WireGuard relay remain dormant (`idle`). They are awakened on-demand by the gateway only when WAN 1 fails.
+* **Complete Host Isolation** : Everything runs inside an all-in-one Alpine Docker container using `--network host`. No packages installed on the host OS.
 
 ---
 
@@ -55,8 +55,8 @@ mobile-wan-backup/
 └── gateway/                   # All-in-one failover gateway under Docker
     ├── Dockerfile             # Alpine image (dnsmasq, wireguard-tools, iptables, python3)
     ├── docker-compose.yml     # Docker host service with cap_add NET_ADMIN
-    ├── dnsmasq.conf           # Isolated DHCP configuration on eth1 (192.168.100.1)
-    ├── entrypoint.sh          # Container entrypoint (ip_forward, dnsmasq, watchdog)
+    ├── .env.example           # Centralized environment configuration template
+    ├── entrypoint.sh          # Container entrypoint (auto-ip, internal dnsmasq, watchdog)
     ├── watchdog.py            # WAN 1 monitoring and automatic failover daemon
     └── wan_ctl.sh             # CLI control and testing utility script
 ```
@@ -95,16 +95,59 @@ mobile-wan-backup/
 
 ### Step 2: Gateway Deployment (`gateway/`)
 
-1. **Copy `gateway/` directory** to the Raspberry Pi or gateway host (e.g. `~/wan-failover`).
-2. **Pull image and start Docker container** (or build locally with `--build`):
+#### Option A: Deploy with repository directory
+1. **Copy `gateway/` directory** to the gateway host (e.g. `~/wan-failover`).
+2. **Configure Environment** (optional if using defaults):
    ```bash
    cd ~/wan-failover
+   cp .env.example .env
+   ```
+3. **Start Docker container** (or build locally with `--build`):
+   ```bash
    docker compose up -d
    ```
-3. **Verify status** :
+4. **Verify status** :
    ```bash
    ./wan_ctl.sh status
    ```
+
+#### Option B: Deploy with standalone `compose.yaml` (No Git clone needed)
+Create `compose.yaml` on the host:
+```yaml
+services:
+  wan-failover-gateway:
+    image: ghcr.io/tichael/cellular-wan-gateway:latest
+    container_name: wan-failover-gateway
+    restart: unless-stopped
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    environment:
+      - PRIMARY_IFACE=eth0
+      - FAILOVER_IFACE=eth1
+      - FAILOVER_GATEWAY_IP=192.168.100.1
+      - FAILOVER_CIDR=24
+      - FAILOVER_NETMASK=255.255.255.0
+      - AUTO_CONFIGURE_IFACE=true
+      - DHCP_ENABLED=true
+      - DHCP_RANGE_START=192.168.100.10
+      - DHCP_RANGE_END=192.168.100.20
+      - DHCP_LEASE_TIME=12h
+      - DNS_SERVERS=9.9.9.10,149.112.112.10
+      - ROUTING_TABLE_ID=100
+      - WG_IFACE=wg0
+      - CLAMP_MSS=true
+      - PING_TARGETS=1.1.1.1 8.8.8.8
+      - PING_TIMEOUT=2
+      - CANARY_IP=198.18.0.1
+      - FAIL_THRESHOLD=3
+      - RESTORE_THRESHOLD=5
+      - CHECK_INTERVAL=5
+    volumes:
+      - /lib/modules:/lib/modules:ro
+```
+Run: `docker compose up -d`
 
 ---
 
