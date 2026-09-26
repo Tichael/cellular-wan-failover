@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+  packages: write
+
 jobs:
   changes:
     name: Detect Changed Paths
@@ -21,13 +25,13 @@ jobs:
           filters: |
             gateway:
               - 'gateway/**'
-              - '.github/workflows/ci.yml'
+              - '.github/workflows/**'
             android:
               - 'android/**'
-              - '.github/workflows/ci.yml'
+              - '.github/workflows/**'
 
-  test-gateway:
-    name: Gateway Tests
+  gateway:
+    name: Gateway (Test & Build)
     needs: changes
     if: ${{ needs.changes.outputs.gateway == 'true' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
@@ -48,8 +52,43 @@ jobs:
         run: |
           pytest gateway
 
-  test-android:
-    name: Android Tests
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry (PR only)
+        if: github.event_name == 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Gateway Image (and Push on PR)
+        uses: docker/build-push-action@v7
+        with:
+          context: ./gateway
+          platforms: linux/arm64,linux/amd64
+          push: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ github.event_name == 'pull_request' && format('ghcr.io/{0}/cellular-wan-gateway:pr-{1}', github.repository_owner, github.event.pull_request.number) || '' }}
+
+      - name: Output Pi Deployment Instructions
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_NUM="${{ github.event.pull_request.number }}"
+          IMAGE="ghcr.io/${{ github.repository_owner }}/cellular-wan-gateway:pr-${PR_NUM}"
+          echo "### 🚀 Gateway Preview Ready for Raspberry Pi" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run the following on your Raspberry Pi to test PR #${PR_NUM}:" >> "$GITHUB_STEP_SUMMARY"
+          echo '```bash' >> "$GITHUB_STEP_SUMMARY"
+          echo "docker pull ${IMAGE}" >> "$GITHUB_STEP_SUMMARY"
+          echo "docker tag ${IMAGE} ghcr.io/${{ github.repository_owner }}/cellular-wan-gateway:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "docker compose up -d" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+  android:
+    name: Android (Test & Build)
     needs: changes
     if: ${{ needs.changes.outputs.android == 'true' || github.event_name == 'push' }}
     runs-on: ubuntu-latest
@@ -62,6 +101,22 @@ jobs:
           distribution: "temurin"
           java-version: "21"
 
+      - name: Set up Go 1.24
+        uses: actions/setup-go@v7
+        with:
+          go-version: "1.24"
+
+      - name: Set up Android NDK
+        run: |
+          echo "Installing Android NDK 27.2.12479018..."
+          "${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager" --install "ndk;27.2.12479018"
+          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/27.2.12479018" >> "$GITHUB_ENV"
+
+      - name: Build libwgrelay.so (arm64-v8a, 16 KB page-aligned)
+        run: |
+          chmod +x android/build_wgrelay.sh
+          bash android/build_wgrelay.sh
+
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v6
 
@@ -70,3 +125,79 @@ jobs:
           cd android
           chmod +x gradlew
           ./gradlew test
+
+      - name: Assemble Release APK (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          cd android
+          ./gradlew assembleRelease \
+            -PversionName="pr-${{ github.event.pull_request.number }}" \
+            -PversionCode=999${{ github.event.pull_request.number }}
+
+      - name: Align and Sign Preview APK (PR only)
+        if: github.event_name == 'pull_request'
+        run: |
+          set -euo pipefail
+          PR_NUM="${{ github.event.pull_request.number }}"
+          UNSIGNED_APK="android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          FINAL_APK="cellular-wan-failover-pr-${PR_NUM}.apk"
+
+          BUILD_TOOLS_DIR=$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+          ZIPALIGN="${BUILD_TOOLS_DIR}/zipalign"
+
+          # 1. 16 KB page alignment for Android 15
+          "$ZIPALIGN" -f -p 16 "$UNSIGNED_APK" aligned.apk
+
+          # 2. Sign APK using keystore secret if present, otherwise fallback
+          if [ -n "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" ] && [ -n "${{ secrets.KEYSTORE_PASSWORD }}" ]; then
+            echo "Signing APK using keystore secret..."
+            echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > preview.keystore
+            KEY_PASS="${{ secrets.KEY_PASSWORD || secrets.KEYSTORE_PASSWORD }}"
+            "$APKSIGNER" sign \
+              --ks preview.keystore \
+              --ks-pass "pass:${{ secrets.KEYSTORE_PASSWORD }}" \
+              --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
+              --key-pass "pass:${KEY_PASS}" \
+              --out "$FINAL_APK" \
+              aligned.apk
+            rm -f preview.keystore
+          else
+            echo "::warning::Keystore secrets not found. Generating fallback installable key..."
+            keytool -genkeypair -v \
+              -keystore fallback.keystore \
+              -alias androidpreview \
+              -keyalg RSA -keysize 2048 -validity 365 \
+              -storepass android -keypass android \
+              -dname "CN=Cellular WAN Failover PR Preview, OU=PR, O=OpenSource, C=US"
+            "$APKSIGNER" sign \
+              --ks fallback.keystore \
+              --ks-pass pass:android \
+              --ks-key-alias androidpreview \
+              --key-pass pass:android \
+              --out "$FINAL_APK" \
+              aligned.apk
+            rm -f fallback.keystore
+          fi
+
+          "$APKSIGNER" verify --verbose "$FINAL_APK"
+          sha256sum "$FINAL_APK" > checksums.sha256
+
+      - name: Upload Android Preview APK (PR only)
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-preview-apk-pr-${{ github.event.pull_request.number }}
+          path: |
+            cellular-wan-failover-pr-${{ github.event.pull_request.number }}.apk
+            checksums.sha256
+          retention-days: 7
+
+      - name: Output Phone Download Instructions
+        if: github.event_name == 'pull_request'
+        run: |
+          PR_NUM="${{ github.event.pull_request.number }}"
+          echo "### 📱 Android Preview Ready for Phone" >> "$GITHUB_STEP_SUMMARY"
+          echo "1. Go to this workflow run's **Artifacts** section below." >> "$GITHUB_STEP_SUMMARY"
+          echo "2. Download \`android-preview-apk-pr-${PR_NUM}\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "3. Install on your phone (or run \`adb install -r cellular-wan-failover-pr-${PR_NUM}.apk\`)." >> "$GITHUB_STEP_SUMMARY"
