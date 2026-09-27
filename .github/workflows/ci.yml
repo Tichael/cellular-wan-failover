@@ -66,24 +66,34 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build Gateway Image (and Push on PR)
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/cellular-wan-gateway
+          tags: |
+            type=raw,value=pr-${{ github.event.pull_request.number }},enable=${{ github.event_name == 'pull_request' }}
+            type=sha,enable=${{ github.event_name == 'push' }}
+
+      - name: Build and push multi-arch Docker image
         uses: docker/build-push-action@v7
         with:
           context: ./gateway
           platforms: linux/arm64,linux/amd64
           push: ${{ github.event_name == 'pull_request' }}
-          tags: ${{ github.event_name == 'pull_request' && format('ghcr.io/{0}/cellular-wan-gateway:pr-{1}', github.repository_owner, github.event.pull_request.number) || '' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
 
       - name: Output Pi Deployment Instructions
         if: github.event_name == 'pull_request'
         run: |
-          PR_NUM="${{ github.event.pull_request.number }}"
-          IMAGE="ghcr.io/${{ github.repository_owner }}/cellular-wan-gateway:pr-${PR_NUM}"
+          IMAGE="${{ steps.meta.outputs.tags }}"
+          BASE_IMAGE="${IMAGE%%:*}"
           echo "### 🚀 Gateway Preview Ready for Raspberry Pi" >> "$GITHUB_STEP_SUMMARY"
-          echo "Run the following on your Raspberry Pi to test PR #${PR_NUM}:" >> "$GITHUB_STEP_SUMMARY"
+          echo "Run the following on your Raspberry Pi to test PR #${{ github.event.pull_request.number }}:" >> "$GITHUB_STEP_SUMMARY"
           echo '```bash' >> "$GITHUB_STEP_SUMMARY"
           echo "docker pull ${IMAGE}" >> "$GITHUB_STEP_SUMMARY"
-          echo "docker tag ${IMAGE} ghcr.io/${{ github.repository_owner }}/cellular-wan-gateway:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "docker tag ${IMAGE} ${BASE_IMAGE}:latest" >> "$GITHUB_STEP_SUMMARY"
           echo "docker compose up -d" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
 
