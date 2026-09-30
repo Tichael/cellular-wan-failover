@@ -60,3 +60,18 @@ data class LogEntry(
         private val nextId = java.util.concurrent.atomic.AtomicLong(0L)
     }
 }
+
+@Serializable
+data class TrustedNetwork(
+    val id: String = java.util.UUID.randomUUID().toString(),
+    val ssid: String,
+    val bssid: String? = null,
+    val addedAt: Long = System.currentTimeMillis()
+)
+
+data class WifiNetworkInfo(
+    val ssid: String,
+    val bssid: String? = null,
+    val isConnected: Boolean = true
+)
+

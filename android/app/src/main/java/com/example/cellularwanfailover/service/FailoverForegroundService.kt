@@ -31,6 +31,7 @@ class FailoverForegroundService : Service() {
         const val ACTION_STOP = "com.example.cellularwanfailover.action.STOP"
         const val ACTION_START_FAILOVER = "com.example.cellularwanfailover.action.START_FAILOVER"
         const val ACTION_STOP_FAILOVER = "com.example.cellularwanfailover.action.STOP_FAILOVER"
+        const val ACTION_UPDATE_NOTIFICATION = "com.example.cellularwanfailover.action.UPDATE_NOTIFICATION"
 
         fun startService(context: Context) {
             val intent = Intent(context, FailoverForegroundService::class.java).apply {
@@ -41,6 +42,15 @@ class FailoverForegroundService : Service() {
             } else {
                 context.startService(intent)
             }
+        }
+
+        fun updateNotification(context: Context) {
+            val intent = Intent(context, FailoverForegroundService::class.java).apply {
+                action = ACTION_UPDATE_NOTIFICATION
+            }
+            try {
+                context.startService(intent)
+            } catch (_: Exception) {}
         }
 
         fun stopService(context: Context) {
@@ -67,6 +77,15 @@ class FailoverForegroundService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
+            ACTION_UPDATE_NOTIFICATION -> {
+                val notification = buildNotification(
+                    controller.failoverState.value,
+                    controller.isNetworkTrusted.value
+                )
+                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                nm.notify(NOTIFICATION_ID, notification)
+                return START_STICKY
+            }
             ACTION_START_FAILOVER -> {
                 scope.launch {
                     controller.startFailover()
@@ -87,7 +106,10 @@ class FailoverForegroundService : Service() {
     }
 
     private fun startInForeground() {
-        val notification = buildNotification(controller.failoverState.value)
+        val notification = buildNotification(
+            controller.failoverState.value,
+            controller.isNetworkTrusted.value
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -102,15 +124,20 @@ class FailoverForegroundService : Service() {
     private fun observeState() {
         stateObservationJob?.cancel()
         stateObservationJob = scope.launch {
-            controller.failoverState.collect { state ->
-                val notification = buildNotification(state)
+            kotlinx.coroutines.flow.combine(
+                controller.failoverState,
+                controller.isNetworkTrusted
+            ) { state, isTrusted ->
+                Pair(state, isTrusted)
+            }.collect { (state, isTrusted) ->
+                val notification = buildNotification(state, isTrusted)
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 nm.notify(NOTIFICATION_ID, notification)
             }
         }
     }
 
-    private fun buildNotification(state: FailoverState): Notification {
+    private fun buildNotification(state: FailoverState, isTrusted: Boolean): Notification {
         val contentIntent = PendingIntent.getActivity(
             this,
             0,
@@ -120,11 +147,15 @@ class FailoverForegroundService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val statusSubtitle = when (state) {
-            FailoverState.IDLE -> "State: Standby (Wi-Fi active)"
-            FailoverState.CONNECTING -> "State: Connecting cellular..."
-            FailoverState.ACTIVE -> "State: Active (4G/5G failover running)"
-            FailoverState.ERROR -> "State: Cellular connection error"
+        val statusSubtitle = if (!isTrusted) {
+            "Paused (Untrusted Network)"
+        } else {
+            when (state) {
+                FailoverState.IDLE -> "State: Standby (Wi-Fi active)"
+                FailoverState.CONNECTING -> "State: Connecting cellular..."
+                FailoverState.ACTIVE -> "State: Active (4G/5G failover running)"
+                FailoverState.ERROR -> "State: Cellular connection error"
+            }
         }
 
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
@@ -137,26 +168,28 @@ class FailoverForegroundService : Service() {
             .setContentIntent(contentIntent)
 
         // Add action buttons
-        if (state == FailoverState.ACTIVE) {
-            val stopFailoverIntent = PendingIntent.getService(
-                this,
-                1,
-                Intent(this, FailoverForegroundService::class.java).apply {
-                    action = ACTION_STOP_FAILOVER
-                },
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            builder.addAction(android.R.drawable.ic_media_pause, "Stop Failover", stopFailoverIntent)
-        } else {
-            val startFailoverIntent = PendingIntent.getService(
-                this,
-                2,
-                Intent(this, FailoverForegroundService::class.java).apply {
-                    action = ACTION_START_FAILOVER
-                },
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-            )
-            builder.addAction(android.R.drawable.ic_media_play, "Start Failover", startFailoverIntent)
+        if (isTrusted) {
+            if (state == FailoverState.ACTIVE) {
+                val stopFailoverIntent = PendingIntent.getService(
+                    this,
+                    1,
+                    Intent(this, FailoverForegroundService::class.java).apply {
+                        action = ACTION_STOP_FAILOVER
+                    },
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(android.R.drawable.ic_media_pause, "Stop Failover", stopFailoverIntent)
+            } else {
+                val startFailoverIntent = PendingIntent.getService(
+                    this,
+                    2,
+                    Intent(this, FailoverForegroundService::class.java).apply {
+                        action = ACTION_START_FAILOVER
+                    },
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
+                builder.addAction(android.R.drawable.ic_media_play, "Start Failover", startFailoverIntent)
+            }
         }
 
         val stopServiceIntent = PendingIntent.getService(
