@@ -28,12 +28,12 @@ This component turns a Linux machine (Raspberry Pi, Mini PC, or Debian/Ubuntu se
 ## 2. Host Prerequisites
 
 ### Configuration of `FAILOVER_IFACE` (e.g. `eth1`)
-By default, **the gateway container automatically manages the failover interface IP** (`AUTO_CONFIGURE_IFACE=true`).
+By default, **the gateway container automatically manages the failover interface IP** (`FAILOVER_AUTO_CONFIGURE_IFACE=true`).
 - The interface will be brought up and assigned `${FAILOVER_GATEWAY_IP}/${FAILOVER_CIDR}` (default: `192.168.100.1/24`).
 - **Fail-fast behavior**: If the interface already has an existing IPv4 address assigned on the host, the container will exit with an error to prevent silent conflicts.
-- If you prefer managing the interface manually on the host (e.g. via `NetworkManager` or `systemd-networkd`), set `AUTO_CONFIGURE_IFACE=false` in your `.env` file.
+- If you prefer managing the interface manually on the host (e.g. via `NetworkManager` or `systemd-networkd`), set `FAILOVER_AUTO_CONFIGURE_IFACE=false` in your `.env` file.
 
-Manual host configuration (optional, only needed if `AUTO_CONFIGURE_IFACE=false`):
+Manual host configuration (optional, only needed if `FAILOVER_AUTO_CONFIGURE_IFACE=false`):
 ```bash
 sudo nmcli con add type ethernet ifname eth1 con-name "WAN2-Link" \
   ipv4.method manual ipv4.addresses 192.168.100.1/24 \
@@ -96,14 +96,13 @@ services:
       # Failover gateway IP & automatic interface configuration
       - FAILOVER_GATEWAY_IP=192.168.100.1
       - FAILOVER_CIDR=24
-      - FAILOVER_NETMASK=255.255.255.0
-      - AUTO_CONFIGURE_IFACE=true
+      - FAILOVER_AUTO_CONFIGURE_IFACE=true
       # Internal DHCP server (dnsmasq)
-      - DHCP_ENABLED=true
-      - DHCP_RANGE_START=192.168.100.10
-      - DHCP_RANGE_END=192.168.100.20
-      - DHCP_LEASE_TIME=12h
-      - DNS_SERVERS=9.9.9.10,149.112.112.10
+      - FAILOVER_DHCP_ENABLED=true
+      # - FAILOVER_DHCP_RANGE_START=192.168.100.10  # Optional (auto-derived from FAILOVER_GATEWAY_IP if omitted)
+      # - FAILOVER_DHCP_RANGE_END=192.168.100.20    # Optional (auto-derived from FAILOVER_GATEWAY_IP if omitted)
+      - FAILOVER_DHCP_LEASE_TIME=12h
+      - FAILOVER_DNS_SERVERS=1.1.1.1,1.0.0.1
       # Routing table & WireGuard
       - ROUTING_TABLE_ID=100
       - WG_IFACE=wg0

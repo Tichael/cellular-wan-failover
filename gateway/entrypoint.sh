@@ -12,32 +12,35 @@ if [ -z "$FAILOVER_GATEWAY_IP" ]; then
     exit 1
 fi
 
-if [ -z "$AUTO_CONFIGURE_IFACE" ]; then
-    echo "[entrypoint] ERROR: AUTO_CONFIGURE_IFACE is not set or empty (must be 'true' or 'false')." >&2
+if [ -z "$FAILOVER_AUTO_CONFIGURE_IFACE" ]; then
+    echo "[entrypoint] ERROR: FAILOVER_AUTO_CONFIGURE_IFACE is not set or empty (must be 'true' or 'false')." >&2
     exit 1
 fi
 
-if [ "$AUTO_CONFIGURE_IFACE" = "true" ] && [ -z "$FAILOVER_CIDR" ]; then
-    echo "[entrypoint] ERROR: FAILOVER_CIDR is not set or empty (required when AUTO_CONFIGURE_IFACE=true)." >&2
+if [ -z "$FAILOVER_DHCP_ENABLED" ]; then
+    echo "[entrypoint] ERROR: FAILOVER_DHCP_ENABLED is not set or empty (must be 'true' or 'false')." >&2
     exit 1
 fi
 
-if [ -z "$DHCP_ENABLED" ]; then
-    echo "[entrypoint] ERROR: DHCP_ENABLED is not set or empty (must be 'true' or 'false')." >&2
-    exit 1
-fi
-
-if [ "$DHCP_ENABLED" = "true" ]; then
-    if [ -z "$FAILOVER_NETMASK" ]; then
-        echo "[entrypoint] ERROR: FAILOVER_NETMASK is not set or empty (required when DHCP_ENABLED=true)." >&2
+if [ "$FAILOVER_AUTO_CONFIGURE_IFACE" = "true" ] || [ "$FAILOVER_DHCP_ENABLED" = "true" ]; then
+    if [ -z "$FAILOVER_CIDR" ]; then
+        echo "[entrypoint] ERROR: FAILOVER_CIDR is not set or empty (required when FAILOVER_AUTO_CONFIGURE_IFACE=true or FAILOVER_DHCP_ENABLED=true)." >&2
         exit 1
     fi
-    if [ -z "$DHCP_LEASE_TIME" ]; then
-        echo "[entrypoint] ERROR: DHCP_LEASE_TIME is not set or empty (required when DHCP_ENABLED=true)." >&2
+    FAILOVER_CIDR="${FAILOVER_CIDR#/}"
+    if ! FAILOVER_NETMASK=$(python3 -c "import ipaddress, sys; cidr = sys.argv[1].lstrip('/'); print(ipaddress.IPv4Network(f'0.0.0.0/{cidr}').netmask)" "$FAILOVER_CIDR" 2>/dev/null); then
+        echo "[entrypoint] ERROR: Invalid FAILOVER_CIDR '$FAILOVER_CIDR'." >&2
         exit 1
     fi
-    if [ -z "$DNS_SERVERS" ]; then
-        echo "[entrypoint] ERROR: DNS_SERVERS is not set or empty (required when DHCP_ENABLED=true)." >&2
+fi
+
+if [ "$FAILOVER_DHCP_ENABLED" = "true" ]; then
+    if [ -z "$FAILOVER_DHCP_LEASE_TIME" ]; then
+        echo "[entrypoint] ERROR: FAILOVER_DHCP_LEASE_TIME is not set or empty (required when FAILOVER_DHCP_ENABLED=true)." >&2
+        exit 1
+    fi
+    if [ -z "$FAILOVER_DNS_SERVERS" ]; then
+        echo "[entrypoint] ERROR: FAILOVER_DNS_SERVERS is not set or empty (required when FAILOVER_DHCP_ENABLED=true)." >&2
         exit 1
     fi
 fi
@@ -52,14 +55,14 @@ if ! ip link show dev "$FAILOVER_IFACE" >/dev/null 2>&1; then
 fi
 
 # 2. Interface IP configuration
-if [ "$AUTO_CONFIGURE_IFACE" = "true" ]; then
+if [ "$FAILOVER_AUTO_CONFIGURE_IFACE" = "true" ]; then
     echo "[entrypoint] Checking status of failover interface '$FAILOVER_IFACE'..."
     EXISTING_IPS=$(ip -4 -o addr show dev "$FAILOVER_IFACE" 2>/dev/null | awk '{print $4}' | paste -sd ", " - || true)
     if [ -n "$EXISTING_IPS" ]; then
         echo "[entrypoint] ERROR: Interface '$FAILOVER_IFACE' is already configured with IPv4 address(es): $EXISTING_IPS"
-        echo "[entrypoint] AUTO_CONFIGURE_IFACE is enabled, but interface is not clean."
+        echo "[entrypoint] FAILOVER_AUTO_CONFIGURE_IFACE is enabled, but interface is not clean."
         echo "[entrypoint] To fix: remove host IP configuration (e.g. 'sudo ip addr flush dev $FAILOVER_IFACE'),"
-        echo "[entrypoint] or set AUTO_CONFIGURE_IFACE=false in your environment if the host manages this interface."
+        echo "[entrypoint] or set FAILOVER_AUTO_CONFIGURE_IFACE=false in your environment if the host manages this interface."
         exit 1
     fi
 
@@ -72,7 +75,7 @@ if [ "$AUTO_CONFIGURE_IFACE" = "true" ]; then
     sysctl -w "net.ipv4.conf.${FAILOVER_IFACE}.rp_filter=2" >/dev/null 2>&1 || true
     sysctl -w "net.ipv4.conf.${FAILOVER_IFACE}.forwarding=1" >/dev/null 2>&1 || true
 else
-    echo "[entrypoint] AUTO_CONFIGURE_IFACE=false: leaving interface '$FAILOVER_IFACE' management to host."
+    echo "[entrypoint] FAILOVER_AUTO_CONFIGURE_IFACE=false: leaving interface '$FAILOVER_IFACE' management to host."
 fi
 
 # 3. Global IPv4 forwarding
@@ -81,11 +84,11 @@ sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
 
 # 4. Dynamic internal dnsmasq generation
 DNSMASQ_PID=""
-if [ "$DHCP_ENABLED" = "true" ]; then
-    if [ -z "$DHCP_RANGE_START" ] || [ -z "$DHCP_RANGE_END" ]; then
+if [ "$FAILOVER_DHCP_ENABLED" = "true" ]; then
+    if [ -z "$FAILOVER_DHCP_RANGE_START" ] || [ -z "$FAILOVER_DHCP_RANGE_END" ]; then
         PREFIX="${FAILOVER_GATEWAY_IP%.*}"
-        DHCP_RANGE_START="${DHCP_RANGE_START:-${PREFIX}.10}"
-        DHCP_RANGE_END="${DHCP_RANGE_END:-${PREFIX}.20}"
+        FAILOVER_DHCP_RANGE_START="${FAILOVER_DHCP_RANGE_START:-${PREFIX}.10}"
+        FAILOVER_DHCP_RANGE_END="${FAILOVER_DHCP_RANGE_END:-${PREFIX}.20}"
     fi
 
     echo "[entrypoint] Generating internal dnsmasq configuration..."
@@ -94,9 +97,9 @@ interface=${FAILOVER_IFACE}
 bind-interfaces
 listen-address=${FAILOVER_GATEWAY_IP}
 port=0
-dhcp-range=${DHCP_RANGE_START},${DHCP_RANGE_END},${FAILOVER_NETMASK},${DHCP_LEASE_TIME}
+dhcp-range=${FAILOVER_DHCP_RANGE_START},${FAILOVER_DHCP_RANGE_END},${FAILOVER_NETMASK},${FAILOVER_DHCP_LEASE_TIME}
 dhcp-option=3,${FAILOVER_GATEWAY_IP}
-dhcp-option=6,${DNS_SERVERS}
+dhcp-option=6,${FAILOVER_DNS_SERVERS}
 log-dhcp
 EOF
 
@@ -105,7 +108,7 @@ EOF
     DNSMASQ_PID=$!
     echo "[entrypoint] dnsmasq running (PID $DNSMASQ_PID)"
 else
-    echo "[entrypoint] DHCP server disabled (DHCP_ENABLED=false)."
+    echo "[entrypoint] DHCP server disabled (FAILOVER_DHCP_ENABLED=false)."
 fi
 
 cleanup() {
