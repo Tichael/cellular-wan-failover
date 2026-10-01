@@ -31,7 +31,6 @@ class FailoverForegroundService : Service() {
         const val ACTION_STOP = "com.example.cellularwanfailover.action.STOP"
         const val ACTION_START_FAILOVER = "com.example.cellularwanfailover.action.START_FAILOVER"
         const val ACTION_STOP_FAILOVER = "com.example.cellularwanfailover.action.STOP_FAILOVER"
-        const val ACTION_UPDATE_NOTIFICATION = "com.example.cellularwanfailover.action.UPDATE_NOTIFICATION"
 
         fun startService(context: Context) {
             val intent = Intent(context, FailoverForegroundService::class.java).apply {
@@ -42,15 +41,6 @@ class FailoverForegroundService : Service() {
             } else {
                 context.startService(intent)
             }
-        }
-
-        fun updateNotification(context: Context) {
-            val intent = Intent(context, FailoverForegroundService::class.java).apply {
-                action = ACTION_UPDATE_NOTIFICATION
-            }
-            try {
-                context.startService(intent)
-            } catch (_: Exception) {}
         }
 
         fun stopService(context: Context) {
@@ -77,15 +67,7 @@ class FailoverForegroundService : Service() {
                 stopSelf()
                 return START_NOT_STICKY
             }
-            ACTION_UPDATE_NOTIFICATION -> {
-                val notification = buildNotification(
-                    controller.failoverState.value,
-                    controller.isNetworkTrusted.value
-                )
-                val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                nm.notify(NOTIFICATION_ID, notification)
-                return START_STICKY
-            }
+
             ACTION_START_FAILOVER -> {
                 scope.launch {
                     controller.startFailover()

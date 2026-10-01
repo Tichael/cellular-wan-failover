@@ -19,7 +19,7 @@ class TrustedNetworkManagerTest {
     @Before
     fun setUp() {
         fakePrefs = FakeSharedPreferences()
-        manager = TrustedNetworkManager(fakePrefs)
+        manager = TrustedNetworkManager(fakePrefs, kotlinx.coroutines.Dispatchers.Unconfined)
     }
 
     @Test
@@ -130,7 +130,7 @@ class TrustedNetworkManagerTest {
         manager.addNetwork("PersistedNet", "00:11:22:33:44:55")
 
         // Create new instance with same SharedPreferences
-        val newManager = TrustedNetworkManager(fakePrefs)
+        val newManager = TrustedNetworkManager(fakePrefs, kotlinx.coroutines.Dispatchers.Unconfined)
         assertEquals(1, newManager.trustedNetworks.value.size)
         assertEquals("PersistedNet", newManager.trustedNetworks.value[0].ssid)
         assertEquals("00:11:22:33:44:55", newManager.trustedNetworks.value[0].bssid)

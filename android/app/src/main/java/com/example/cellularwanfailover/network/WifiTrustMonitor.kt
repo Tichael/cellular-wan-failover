@@ -42,8 +42,6 @@ class WifiTrustMonitor(
     private var scope: CoroutineScope? = null
     private var observeJob: Job? = null
 
-    var onTrustChanged: ((isTrusted: Boolean, wifiInfo: WifiNetworkInfo?) -> Unit)? = null
-
     @Synchronized
     fun start() {
         if (isMonitoring.getAndSet(true)) return
@@ -167,7 +165,6 @@ class WifiTrustMonitor(
 
         if (previous != isTrusted) {
             Log.i(TAG, "Network trust state changed: $previous -> $isTrusted (SSID: ${info?.ssid})")
-            onTrustChanged?.invoke(isTrusted, info)
         }
     }
 }

@@ -9,9 +9,13 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 
 class TrustedNetworkManager(
-    private val prefs: SharedPreferences
+    private val prefs: SharedPreferences,
+    private val dispatcher: kotlinx.coroutines.CoroutineDispatcher = kotlinx.coroutines.Dispatchers.IO
 ) {
     companion object {
         private const val TAG = "TrustedNetworkManager"
@@ -32,7 +36,9 @@ class TrustedNetworkManager(
     val trustedNetworks: StateFlow<List<TrustedNetwork>> = _trustedNetworks.asStateFlow()
 
     init {
-        loadNetworks()
+        kotlinx.coroutines.CoroutineScope(dispatcher).launch {
+            loadNetworks()
+        }
     }
 
     @Synchronized

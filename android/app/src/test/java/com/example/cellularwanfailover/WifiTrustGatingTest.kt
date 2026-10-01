@@ -18,7 +18,7 @@ class WifiTrustGatingTest {
     @Before
     fun setUp() {
         fakePrefs = FakeSharedPreferences()
-        trustedNetworkManager = TrustedNetworkManager(fakePrefs)
+        trustedNetworkManager = TrustedNetworkManager(fakePrefs, kotlinx.coroutines.Dispatchers.Unconfined)
     }
 
     @Test

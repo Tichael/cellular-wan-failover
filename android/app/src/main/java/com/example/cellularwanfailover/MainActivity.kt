@@ -96,11 +96,6 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    override fun onResume() {
-        super.onResume()
-        FailoverForegroundService.updateNotification(this)
-    }
-
     private fun requestIgnoreBatteryOptimizations() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -145,7 +140,6 @@ fun MainScreen(
         ActivityResultContracts.RequestMultiplePermissions()
     ) {
         controller.refreshWifiNetworkInfo()
-        FailoverForegroundService.updateNotification(context)
     }
 
     LaunchedEffect(Unit) {
@@ -504,8 +498,16 @@ fun TrustedNetworksCard(
             ) {
                 Text(text = "Current Network:", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (currentSsid == "<unknown ssid>") {
-                    TextButton(onClick = onRequestLocationPermission) {
-                        Text("Grant Location Permission", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                    val context = LocalContext.current
+                    val isPermissionGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    TextButton(onClick = {
+                        if (isPermissionGranted) {
+                            context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                        } else {
+                            onRequestLocationPermission()
+                        }
+                    }) {
+                        Text(if (isPermissionGranted) "Enable Location Services" else "Grant Location Permission", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
                     }
                 } else {
                     Text(
