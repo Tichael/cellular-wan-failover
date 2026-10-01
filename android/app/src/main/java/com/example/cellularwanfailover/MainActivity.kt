@@ -21,14 +21,17 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -64,6 +67,8 @@ import com.example.cellularwanfailover.controller.FailoverController
 import com.example.cellularwanfailover.model.CellularState
 import com.example.cellularwanfailover.model.FailoverState
 import com.example.cellularwanfailover.model.LogEntry
+import com.example.cellularwanfailover.model.TrustedNetwork
+import com.example.cellularwanfailover.model.WifiNetworkInfo
 import com.example.cellularwanfailover.service.FailoverForegroundService
 import kotlinx.coroutines.launch
 import java.util.Locale
@@ -121,21 +126,31 @@ fun MainScreen(
     val wifiIp by controller.wifiIp.collectAsStateWithLifecycle()
     val bytesTransmitted by controller.bytesTransmitted.collectAsStateWithLifecycle()
     val logs by controller.logs.collectAsStateWithLifecycle()
+    val isNetworkTrusted by controller.isNetworkTrusted.collectAsStateWithLifecycle()
+    val currentWifiNetwork by controller.currentWifiNetwork.collectAsStateWithLifecycle()
+    val trustedNetworks by controller.trustedNetworks.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val clipboardManager = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
     var showWgDialog by remember { mutableStateOf(false) }
 
-    // Request POST_NOTIFICATIONS permission on Android 13+
-    val permissionLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) {}
+    // Request permissions for notifications and Wi-Fi SSID access (location)
+    val permissionsLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) {
+        controller.refreshWifiNetworkInfo()
+    }
 
     LaunchedEffect(Unit) {
+        val perms = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            perms.add(Manifest.permission.POST_NOTIFICATIONS)
         }
+        permissionsLauncher.launch(perms.toTypedArray())
     }
 
     Scaffold(
@@ -150,20 +165,44 @@ fun MainScreen(
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
             // Header
-            HeaderView(failoverState = failoverState)
+            HeaderView(
+                failoverState = failoverState,
+                isNetworkTrusted = isNetworkTrusted
+            )
 
             // Status Card
             StatusCard(
                 failoverState = failoverState,
                 cellularState = cellularState,
                 wifiIp = wifiIp,
+                currentWifi = currentWifiNetwork,
+                isNetworkTrusted = isNetworkTrusted,
                 bytesTransmitted = bytesTransmitted,
                 wireguardPublicKey = controller.wireguardPublicKey
+            )
+
+            // Trusted Networks Card
+            TrustedNetworksCard(
+                isNetworkTrusted = isNetworkTrusted,
+                currentWifi = currentWifiNetwork,
+                trustedNetworks = trustedNetworks,
+                onAddCurrentNetwork = { controller.addCurrentNetwork() },
+                onRemoveNetwork = { id -> controller.removeTrustedNetwork(id) },
+                onClearAll = { controller.clearTrustedNetworks() },
+                onRequestLocationPermission = {
+                    permissionsLauncher.launch(
+                        arrayOf(
+                            Manifest.permission.ACCESS_FINE_LOCATION,
+                            Manifest.permission.ACCESS_COARSE_LOCATION
+                        )
+                    )
+                }
             )
 
             // Controls Card
             ControlsCard(
                 failoverState = failoverState,
+                isNetworkTrusted = isNetworkTrusted,
                 onToggleFailover = {
                     scope.launch {
                         if (failoverState == FailoverState.ACTIVE) {
@@ -234,7 +273,10 @@ fun MainScreen(
 }
 
 @Composable
-fun HeaderView(failoverState: FailoverState) {
+fun HeaderView(
+    failoverState: FailoverState,
+    isNetworkTrusted: Boolean
+) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically,
@@ -254,11 +296,15 @@ fun HeaderView(failoverState: FailoverState) {
             )
         }
 
-        val (badgeColor, badgeText) = when (failoverState) {
-            FailoverState.IDLE -> Color(0xFF689F38) to "STANDBY"
-            FailoverState.CONNECTING -> Color(0xFFF57C00) to "CONNECTING"
-            FailoverState.ACTIVE -> Color(0xFFD32F2F) to "FAILOVER ACTIVE"
-            FailoverState.ERROR -> Color(0xFFC2185B) to "ERROR"
+        val (badgeColor, badgeText) = if (!isNetworkTrusted) {
+            Color(0xFFE65100) to "PAUSED (UNTRUSTED)"
+        } else {
+            when (failoverState) {
+                FailoverState.IDLE -> Color(0xFF689F38) to "STANDBY"
+                FailoverState.CONNECTING -> Color(0xFFF57C00) to "CONNECTING"
+                FailoverState.ACTIVE -> Color(0xFFD32F2F) to "FAILOVER ACTIVE"
+                FailoverState.ERROR -> Color(0xFFC2185B) to "ERROR"
+            }
         }
 
         Box(
@@ -291,6 +337,8 @@ fun StatusCard(
     failoverState: FailoverState,
     cellularState: CellularState,
     wifiIp: String?,
+    currentWifi: WifiNetworkInfo?,
+    isNetworkTrusted: Boolean,
     bytesTransmitted: Long,
     wireguardPublicKey: String
 ) {
@@ -311,11 +359,27 @@ fun StatusCard(
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text(text = "Wi-Fi Interface (LAN):", fontSize = 13.sp)
+                val wifiLabel = when {
+                    wifiIp != null && currentWifi?.ssid != null && currentWifi.ssid != "<unknown ssid>" ->
+                        "$wifiIp (${currentWifi.ssid})"
+                    wifiIp != null -> wifiIp
+                    else -> "Disconnected"
+                }
                 Text(
-                    text = wifiIp ?: "Disconnected",
+                    text = wifiLabel,
                     fontWeight = FontWeight.Bold,
                     fontSize = 13.sp,
                     color = if (wifiIp != null) MaterialTheme.colorScheme.primary else Color.Gray
+                )
+            }
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(text = "Trusted Wi-Fi Gating:", fontSize = 13.sp)
+                Text(
+                    text = if (isNetworkTrusted) "Approved (Trusted Wi-Fi)" else "Paused (Untrusted Network)",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    color = if (isNetworkTrusted) Color(0xFF388E3C) else Color(0xFFE65100)
                 )
             }
 
@@ -331,8 +395,13 @@ fun StatusCard(
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text(text = "WireGuard Relay:", fontSize = 13.sp)
+                val wgText = when {
+                    failoverState == FailoverState.ACTIVE -> "Listening UDP :51820"
+                    !isNetworkTrusted -> "Halted (Untrusted Network)"
+                    else -> "Standby (Port :51820)"
+                }
                 Text(
-                    text = if (failoverState == FailoverState.ACTIVE) "Listening UDP :51820" else "Inactive (Port :51820)",
+                    text = wgText,
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
                     color = if (failoverState == FailoverState.ACTIVE) Color(0xFF388E3C) else Color.Gray
@@ -351,7 +420,12 @@ fun StatusCard(
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                 Text(text = "HTTP Control API:", fontSize = 13.sp)
-                Text(text = "Port 8989 (Active)", fontSize = 13.sp, fontWeight = FontWeight.Medium)
+                Text(
+                    text = if (isNetworkTrusted) "Port 8989 (Active)" else "Port 8989 (Halted / Paused)",
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = if (isNetworkTrusted) MaterialTheme.colorScheme.onSurfaceVariant else Color(0xFFE65100)
+                )
             }
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -368,8 +442,203 @@ fun StatusCard(
 }
 
 @Composable
+fun TrustedNetworksCard(
+    isNetworkTrusted: Boolean,
+    currentWifi: WifiNetworkInfo?,
+    trustedNetworks: List<TrustedNetwork>,
+    onAddCurrentNetwork: () -> Unit,
+    onRemoveNetwork: (String) -> Unit,
+    onClearAll: () -> Unit,
+    onRequestLocationPermission: () -> Unit
+) {
+    var showClearConfirmDialog by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Trusted Wi-Fi Whitelist",
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 15.sp
+                )
+                val (badgeBg, badgeFg, badgeLabel) = when {
+                    currentWifi == null -> Triple(Color(0xFFE0E0E0), Color(0xFF616161), "NO WI-FI")
+                    isNetworkTrusted -> Triple(Color(0xFFE8F5E9), Color(0xFF2E7D32), "TRUSTED")
+                    else -> Triple(Color(0xFFFFEBEE), Color(0xFFC62828), "UNTRUSTED")
+                }
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(badgeBg)
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        text = badgeLabel,
+                        color = badgeFg,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            // Current Wi-Fi info line
+            val currentSsid = currentWifi?.ssid
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(text = "Current Network:", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (currentSsid == "<unknown ssid>") {
+                    val context = LocalContext.current
+                    val isPermissionGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    TextButton(onClick = {
+                        if (isPermissionGranted) {
+                            context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                        } else {
+                            onRequestLocationPermission()
+                        }
+                    }) {
+                        Text(if (isPermissionGranted) "Enable Location Services" else "Grant Location Permission", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                    }
+                } else {
+                    Text(
+                        text = currentSsid ?: "Not connected",
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 13.sp
+                    )
+                }
+            }
+
+            HorizontalDivider()
+
+            // Buttons: Add Current Network & Clear All
+            val canAddCurrent = currentWifi != null &&
+                    currentSsid != null &&
+                    currentSsid != "<unknown ssid>" &&
+                    trustedNetworks.none { it.ssid.equals(currentSsid, ignoreCase = false) }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Button(
+                    onClick = onAddCurrentNetwork,
+                    modifier = Modifier.weight(1f),
+                    enabled = canAddCurrent
+                ) {
+                    val addText = when {
+                        currentWifi == null -> "No Wi-Fi"
+                        currentSsid == "<unknown ssid>" -> "Location Needed"
+                        !canAddCurrent -> "Already Added"
+                        else -> "Add Current Network"
+                    }
+                    Text(addText, fontSize = 12.sp)
+                }
+
+                OutlinedButton(
+                    onClick = { showClearConfirmDialog = true },
+                    enabled = trustedNetworks.isNotEmpty(),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        contentColor = MaterialTheme.colorScheme.error
+                    )
+                ) {
+                    Text("Clear All", fontSize = 12.sp)
+                }
+            }
+
+            // List of trusted networks
+            if (trustedNetworks.isEmpty()) {
+                Text(
+                    text = "No trusted networks added yet. Gateway services remain halted until an approved Wi-Fi network is added.",
+                    color = Color.Gray,
+                    fontSize = 12.sp,
+                    modifier = Modifier.padding(vertical = 4.dp)
+                )
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 140.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    trustedNetworks.forEach { network ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = network.ssid,
+                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 13.sp
+                                )
+                                if (network.bssid != null) {
+                                    Text(
+                                        text = "BSSID: ${network.bssid}",
+                                        fontSize = 10.sp,
+                                        color = Color.Gray,
+                                        fontFamily = FontFamily.Monospace
+                                    )
+                                }
+                            }
+                            TextButton(
+                                onClick = { onRemoveNetwork(network.id) }
+                            ) {
+                                Text("Remove", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (showClearConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showClearConfirmDialog = false },
+            title = { Text("Clear All Trusted Networks?") },
+            text = {
+                Text("This will remove all approved networks. Gateway services will immediately halt until a network is added.")
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onClearAll()
+                        showClearConfirmDialog = false
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Clear All")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showClearConfirmDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+}
+
+@Composable
 fun ControlsCard(
     failoverState: FailoverState,
+    isNetworkTrusted: Boolean,
     onToggleFailover: () -> Unit,
     onShowWireGuardConfig: () -> Unit,
     onRequestIgnoreBattery: () -> Unit
@@ -392,9 +661,11 @@ fun ControlsCard(
                 colors = ButtonDefaults.buttonColors(
                     containerColor = if (failoverState == FailoverState.ACTIVE) Color(0xFFD32F2F) else MaterialTheme.colorScheme.primary
                 ),
-                enabled = failoverState != FailoverState.CONNECTING
+                enabled = isNetworkTrusted && failoverState != FailoverState.CONNECTING
             ) {
-                if (failoverState == FailoverState.CONNECTING) {
+                if (!isNetworkTrusted) {
+                    Text("Start Failover (Paused: Untrusted Wi-Fi)")
+                } else if (failoverState == FailoverState.CONNECTING) {
                     CircularProgressIndicator(
                         modifier = Modifier.size(18.dp),
                         color = Color.White,

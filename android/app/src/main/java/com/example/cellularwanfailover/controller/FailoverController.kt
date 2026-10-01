@@ -8,8 +8,12 @@ import com.example.cellularwanfailover.http.FailoverControlDelegate
 import com.example.cellularwanfailover.model.CellularState
 import com.example.cellularwanfailover.model.FailoverState
 import com.example.cellularwanfailover.model.LogEntry
+import com.example.cellularwanfailover.model.TrustedNetwork
+import com.example.cellularwanfailover.model.WifiNetworkInfo
 import com.example.cellularwanfailover.network.CellularNetworkManager
 import com.example.cellularwanfailover.network.NetworkUtils
+import com.example.cellularwanfailover.network.TrustedNetworkManager
+import com.example.cellularwanfailover.network.WifiTrustMonitor
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -50,6 +54,12 @@ class FailoverController private constructor(
     val wireGuardManager = WireGuardManager(appContext)
     val httpServer = ControlHttpServer(port = 8989, delegate = this)
     val broadcaster = DiscoveryBroadcaster(httpPort = 8989, broadcastPort = 8990)
+    val trustedNetworkManager = TrustedNetworkManager(appContext)
+    val wifiTrustMonitor = WifiTrustMonitor(appContext, trustedNetworkManager)
+
+    val isNetworkTrusted: StateFlow<Boolean> = wifiTrustMonitor.isNetworkTrusted
+    val currentWifiNetwork: StateFlow<WifiNetworkInfo?> = wifiTrustMonitor.currentWifiInfo
+    val trustedNetworks: StateFlow<List<TrustedNetwork>> = trustedNetworkManager.trustedNetworks
 
     private val _failoverState = MutableStateFlow(FailoverState.IDLE)
     val failoverState: StateFlow<FailoverState> = _failoverState.asStateFlow()
@@ -109,9 +119,32 @@ class FailoverController private constructor(
         }
     }
 
+    private var isServiceRunning = false
+    private var trustObservationJob: Job? = null
+
     fun startServiceComponents() {
+        if (isServiceRunning) return
+        isServiceRunning = true
+
+        logEvent("FailoverController", "Starting service and network trust monitoring...")
+        wifiTrustMonitor.start()
+
+        trustObservationJob?.cancel()
+        trustObservationJob = scope.launch {
+            wifiTrustMonitor.isNetworkTrusted.collect { isTrusted ->
+                if (isTrusted) {
+                    resumeGatewayServices()
+                } else {
+                    pauseGatewayServices()
+                }
+            }
+        }
+    }
+
+    private fun resumeGatewayServices() {
         refreshWifiIp()
-        logEvent("FailoverController", "Starting gateway components...")
+        val ssid = wifiTrustMonitor.currentWifiInfo.value?.ssid ?: "Wi-Fi"
+        logEvent("FailoverController", "Connected to trusted network ($ssid). Starting gateway services...")
 
         try {
             httpServer.start()
@@ -128,21 +161,59 @@ class FailoverController private constructor(
         startMonitoringLoop()
     }
 
-    fun stopServiceComponents() {
-        logEvent("FailoverController", "Stopping gateway components...")
+    private fun pauseGatewayServices() {
+        logEvent("FailoverController", "Untrusted network or mobile data alone. Halting gateway services (Paused)...")
         monitorJob?.cancel()
         monitorJob = null
+
+        broadcaster.stop()
+        httpServer.stop()
 
         scope.launch {
             stopFailover()
         }
+    }
 
-        broadcaster.stop()
-        httpServer.stop()
+    fun stopServiceComponents() {
+        logEvent("FailoverController", "Stopping gateway components...")
+        isServiceRunning = false
+        trustObservationJob?.cancel()
+        trustObservationJob = null
+
+        wifiTrustMonitor.stop()
+        pauseGatewayServices()
+    }
+
+    fun addCurrentNetwork(): Boolean {
+        val info = wifiTrustMonitor.currentWifiInfo.value ?: return false
+        if (info.ssid == "<unknown ssid>" || info.ssid.isBlank()) return false
+        val added = trustedNetworkManager.addNetwork(info.ssid, info.bssid)
+        if (added) {
+            logEvent("FailoverController", "Added current network '${info.ssid}' to trusted whitelist")
+        }
+        return added
+    }
+
+    fun removeTrustedNetwork(id: String): Boolean {
+        return trustedNetworkManager.removeNetwork(id)
+    }
+
+    fun clearTrustedNetworks() {
+        trustedNetworkManager.clearAll()
+    }
+
+    fun refreshWifiNetworkInfo() {
+        wifiTrustMonitor.refresh()
+        refreshWifiIp()
     }
 
     override suspend fun startFailover(): Boolean {
         mutex.withLock {
+            if (!wifiTrustMonitor.isNetworkTrusted.value) {
+                logEvent("FailoverController", "Cannot start failover: untrusted network or mobile data alone", true)
+                return false
+            }
+
             if (_failoverState.value == FailoverState.ACTIVE) {
                 logEvent("FailoverController", "Cellular failover relay is already active")
                 return true
