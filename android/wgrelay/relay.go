@@ -14,7 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
@@ -51,12 +50,18 @@ func GetBytesTransmitted() int64 {
 	return int64(totalBytesTransmitted.Load())
 }
 
-func StartRelay(port int, privKeyBase64, peerPubKeyBase64 string, netHandle uint64) error {
+func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, netHandle uint64) error {
 	relayMutex.Lock()
 	defer relayMutex.Unlock()
 
 	if isRunningState.Load() {
 		StopRelayLocked()
+	}
+
+	// Listen only on the Wi-Fi address, never on cellular
+	bind, err := NewSingleAddrBind(bindAddr)
+	if err != nil {
+		return err
 	}
 
 	privKeyBytes, err := base64.StdEncoding.DecodeString(privKeyBase64)
@@ -166,7 +171,6 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64 string, netHandle uint
 	// WireGuard device
 	netTun := NewNetTun(ep, 1420)
 	logger := device.NewLogger(device.LogLevelVerbose, "[wgrelay] ")
-	bind := conn.NewDefaultBind()
 	dev := device.NewDevice(netTun, bind, logger)
 
 	uapiConfig := fmt.Sprintf(
@@ -197,7 +201,7 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64 string, netHandle uint
 	currentStack = s
 	isRunningState.Store(true)
 
-	androidLog(fmt.Sprintf("Relay started on :%d, netHandle=%d", port, netHandle))
+	androidLog(fmt.Sprintf("Relay started on %s:%d, netHandle=%d", bindAddr, port, netHandle))
 	return nil
 }
 

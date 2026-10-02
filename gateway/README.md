@@ -54,6 +54,8 @@ sudo modprobe iptable_nat
 
 The gateway runs as a self-contained, lightweight Alpine Docker container.
 
+> **Upgrading:** the gateway and the Android app must be updated together. Newer gateways generate their own WireGuard key and no longer use `GET /v1/wireguard/config`. Older phones still serve it but ignore the gateway key, and newer phones reject start requests that don't include one.
+
 ### Configuration (`.env`)
 Copy the provided `.env.example` to `.env` and customize parameters if needed:
 ```bash
@@ -153,8 +155,10 @@ docker run -d \
    - Listens for UDP broadcast beacons sent every 5 seconds by the Android app on port `8990`.
    - Handles dynamic smartphone Wi-Fi IP changes automatically with no static DHCP reservation needed.
 4. **Failover Trigger (after 3 consecutive failures)** :
-   - Calls `POST http://<phone_ip>:8989/v1/failover/start` to activate cellular data and the WireGuard relay on the phone.
-   - Retrieves configuration via `GET http://<phone_ip>:8989/v1/wireguard/config`.
+   - Generates a fresh WireGuard key pair locally (`wg genkey`). The private key never leaves the gateway.
+   - Reads the phone's WireGuard public key and port from `GET http://<phone_ip>:8989/v1/status`.
+   - Calls `POST http://<phone_ip>:8989/v1/failover/start` with `{"gateway_public_key": "<base64>"}` to activate cellular data and the WireGuard relay on the phone.
+   - Builds `/etc/wireguard/wg0.conf` itself from validated fields only (keys, IPv4 addresses, port; mode `0600`). Nothing received from the phone is written verbatim, so the phone cannot inject `PostUp`-style commands.
    - Brings up WireGuard interface `wg0`.
    - Applies an isolated policy routing table (**Table 100**) so only UniFi WAN 2 traffic is redirected:
      ```bash

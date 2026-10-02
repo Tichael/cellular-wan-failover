@@ -6,6 +6,8 @@ to the Android cellular relay via WireGuard when an outage is detected.
 """
 
 import argparse
+import base64
+import ipaddress
 import json
 import logging
 import os
@@ -41,7 +43,10 @@ class AndroidFailoverClient:
 
     def _request(self, path: str, method: str = "GET", data: bytes | None = None, timeout: float | None = None) -> str:
         url = f"{self.base_url}{path}"
-        req = urllib.request.Request(url, data=data, headers={"User-Agent": "Cellular-WAN-Gateway/1.0"}, method=method)
+        headers = {"User-Agent": "Cellular-WAN-Gateway/1.0"}
+        if data:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, headers=headers, method=method)
         t = timeout or self.timeout
         for attempt in range(3):
             try:
@@ -56,11 +61,9 @@ class AndroidFailoverClient:
     def get_status(self) -> dict:
         return json.loads(self._request("/v1/status"))
 
-    def get_wireguard_config(self) -> str:
-        return self._request("/v1/wireguard/config")
-
-    def start_failover(self) -> dict:
-        return json.loads(self._request("/v1/failover/start", method="POST", data=b"", timeout=15.0))
+    def start_failover(self, gateway_public_key: str) -> dict:
+        body = json.dumps({"gateway_public_key": gateway_public_key}).encode("utf-8")
+        return json.loads(self._request("/v1/failover/start", method="POST", data=body, timeout=15.0))
 
     def stop_failover(self) -> dict:
         return json.loads(self._request("/v1/failover/stop", method="POST", data=b"", timeout=10.0))
@@ -148,45 +151,21 @@ class RoutingManager:
             logger.error(f"Command error {' '.join(cmd)}: {e.stderr.strip()}")
             raise
 
-    def setup_wireguard_interface(self, config_text: str):
-        """Adapts and writes WireGuard config received from Android, then brings up interface."""
-        # Adjust config to prevent wg-quick from overriding default routing table
-        # and avoid resolvconf conflicts in a minimal container.
-        lines = []
-        for line in config_text.splitlines():
-            stripped = line.strip()
-            # Strip DNS to avoid altering container/host resolver
-            if stripped.startswith("DNS"):
-                continue
-            lines.append(line)
-
-        # Add Table = off under [Interface] to delegate routing to isolated table
-        adapted_lines = []
-        under_interface = False
-        table_added = False
-        for line in lines:
-            adapted_lines.append(line)
-            if line.strip().lower() == "[interface]":
-                under_interface = True
-            elif line.strip().startswith("[") and under_interface:
-                if not table_added:
-                    adapted_lines.insert(len(adapted_lines) - 1, f"Table = off")
-                    table_added = True
-                under_interface = False
-        if under_interface and not table_added:
-            adapted_lines.append(f"Table = off")
-
-        conf_path = f"/etc/wireguard/{self.wg_iface}.conf"
-        os.makedirs("/etc/wireguard", exist_ok=True)
-        with open(conf_path, "w") as f:
-            f.write("\n".join(adapted_lines) + "\n")
-        os.chmod(conf_path, 0o600)
+    def setup_wireguard_interface(self, config_text: str, conf_dir: str = "/etc/wireguard"):
+        """Writes a locally built WireGuard config (see build_wg_config) and brings up the interface."""
+        conf_path = os.path.join(conf_dir, f"{self.wg_iface}.conf")
+        os.makedirs(conf_dir, exist_ok=True)
+        # Create with 0600 from the start so the private key is never world-readable
+        fd = os.open(conf_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(config_text)
 
         # Preemptive teardown if wg0 was already active
         self._run(["wg-quick", "down", self.wg_iface])
 
         logger.info(f"Bringing up WireGuard ({self.wg_iface})...")
-        self._run(["wg-quick", "up", self.wg_iface], check=True)
+        self._run(["wg-quick", "up", conf_path], check=True)
         logger.info(f"Interface {self.wg_iface} active.")
 
     def teardown_wireguard_interface(self):
@@ -254,6 +233,95 @@ class RoutingManager:
         # 4. Flush routing table
         self._run(["ip", "route", "flush", "table", self.table_id])
         logger.info("Network cleanup complete.")
+
+
+def generate_wg_keypair() -> tuple[str, str]:
+    """Generates an ephemeral WireGuard key pair locally. The private key never leaves the gateway."""
+    private_key = subprocess.run(["wg", "genkey"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True).stdout.strip()
+    public_key = subprocess.run(["wg", "pubkey"], input=private_key, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True).stdout.strip()
+    return private_key, public_key
+
+
+def validate_wg_key(value: object) -> str:
+    """Returns the canonical base64 form of a 32-byte WireGuard key, or raises ValueError."""
+    if not isinstance(value, str):
+        raise ValueError("WireGuard key must be a string")
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (ValueError, TypeError) as e:
+        raise ValueError(f"Invalid WireGuard key encoding: {e}") from e
+    if len(raw) != 32:
+        raise ValueError(f"Invalid WireGuard key length: {len(raw)} bytes (expected 32)")
+    return base64.b64encode(raw).decode("ascii")
+
+
+def validate_ipv4(value: object, require_private: bool = False) -> ipaddress.IPv4Address:
+    if not isinstance(value, str):
+        raise ValueError("IP address must be a string")
+    try:
+        addr = ipaddress.IPv4Address(value)
+    except ipaddress.AddressValueError as e:
+        raise ValueError(f"Invalid IPv4 address: {value!r}") from e
+    if require_private and not addr.is_private:
+        raise ValueError(f"IPv4 address must be private: {addr}")
+    return addr
+
+
+def validate_port(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= 65535:
+        raise ValueError(f"Invalid port: {value!r}")
+    return value
+
+
+def build_wg_config(private_key: str, phone_public_key: str, phone_ip: str, port: int, peer_ip: str) -> str:
+    """
+    Builds the gateway wg-quick config from validated fields only.
+    Every value is parsed and re-serialized, so no text received from the phone
+    reaches the file verbatim (prevents PostUp/PreUp command injection).
+    """
+    private_key = validate_wg_key(private_key)
+    phone_public_key = validate_wg_key(phone_public_key)
+    endpoint_ip = validate_ipv4(phone_ip)
+    tunnel_ip = validate_ipv4(peer_ip, require_private=True)
+    port = validate_port(port)
+    return (
+        "[Interface]\n"
+        f"PrivateKey = {private_key}\n"
+        f"Address = {tunnel_ip}/24\n"
+        "Table = off\n"
+        "\n"
+        "[Peer]\n"
+        f"PublicKey = {phone_public_key}\n"
+        f"Endpoint = {endpoint_ip}:{port}\n"
+        "AllowedIPs = 0.0.0.0/0\n"
+        "PersistentKeepalive = 25\n"
+    )
+
+
+def activate_failover(client: "AndroidFailoverClient", routing: "RoutingManager") -> dict:
+    """Generates a fresh gateway key, starts the phone relay, and brings up wg0 with routing/NAT."""
+    private_key, public_key = generate_wg_keypair()
+
+    status = client.get_status()
+    wg_info = status.get("wireguard")
+    if not isinstance(wg_info, dict):
+        raise ValueError("Smartphone status did not include WireGuard details")
+
+    # Validate before asking the phone to bring up cellular
+    config = build_wg_config(
+        private_key=private_key,
+        phone_public_key=wg_info.get("public_key"),
+        phone_ip=client.phone_ip,
+        port=wg_info.get("port"),
+        peer_ip=wg_info.get("peer_ip"),
+    )
+
+    res = client.start_failover(public_key)
+    logger.info(f"Smartphone wake response: {res}")
+
+    routing.setup_wireguard_interface(config)
+    routing.enable_routing_and_nat()
+    return res
 
 
 def check_tunnel_canary(iface: str, canary_ip: str = "198.18.0.1", timeout: int = 2) -> bool:
@@ -376,11 +444,7 @@ def main():
 
     if args.start_now:
         client = get_client()
-        cfg = client.get_wireguard_config()
-        res = client.start_failover()
-        logger.info(f"Smartphone wake response: {res}")
-        routing.setup_wireguard_interface(cfg)
-        routing.enable_routing_and_nat()
+        activate_failover(client, routing)
         logger.info("Cellular failover manually activated successfully.")
         discovery.stop()
         return
@@ -496,19 +560,7 @@ def main():
                         else:
                             client = AndroidFailoverClient(phone_ip=current_phone_ip, http_port=args.http_port)
                             try:
-                                # 1. Fetch WireGuard configuration
-                                wg_cfg = client.get_wireguard_config()
-
-                                # 2. Command smartphone to activate cellular and WireGuard
-                                res = client.start_failover()
-                                logger.info(f"Smartphone wake response: {res}")
-
-                                # 3. Bring up local WireGuard interface wg0
-                                routing.setup_wireguard_interface(wg_cfg)
-
-                                # 4. Activate dedicated routing eth1 -> wg0 and MASQUERADE
-                                routing.enable_routing_and_nat()
-
+                                activate_failover(client, routing)
                                 failover_active = True
                                 failed_probes = 0
                                 logger.info(">>> Cellular WAN 2 Failover 100% OPERATIONAL. Router routes traffic via smartphone. <<<")
