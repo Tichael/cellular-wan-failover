@@ -311,9 +311,9 @@ jobs:
               if [ -z "$FEATURES$FIXES$OTHERS" ]; then
                 echo "No code changes recorded — see full commit history."
               else
-                [ -n "$FEATURES" ] && printf "## What's New\n%s\n\n" "$FEATURES"
-                [ -n "$FIXES"    ] && printf "## Bug Fixes\n%s\n\n"  "$FIXES"
-                [ -n "$OTHERS"   ] && printf "## Other Changes\n%s\n" "$OTHERS"
+                if [ -n "$FEATURES" ]; then printf "## What's New\n%s\n\n" "$FEATURES"; fi
+                if [ -n "$FIXES"    ]; then printf "## Bug Fixes\n%s\n\n"  "$FIXES"; fi
+                if [ -n "$OTHERS"   ]; then printf "## Other Changes\n%s\n" "$OTHERS"; fi
               fi
             fi
           } > release_notes.txt
@@ -401,9 +401,9 @@ jobs:
               if [ -z "$FEATURES$FIXES$OTHERS" ]; then
                 echo "No code changes recorded — see full commit history."
               else
-                [ -n "$FEATURES" ] && printf "## What's New\n%s\n\n" "$FEATURES"
-                [ -n "$FIXES"    ] && printf "## Bug Fixes\n%s\n\n"  "$FIXES"
-                [ -n "$OTHERS"   ] && printf "## Other Changes\n%s\n" "$OTHERS"
+                if [ -n "$FEATURES" ]; then printf "## What's New\n%s\n\n" "$FEATURES"; fi
+                if [ -n "$FIXES"    ]; then printf "## Bug Fixes\n%s\n\n"  "$FIXES"; fi
+                if [ -n "$OTHERS"   ]; then printf "## Other Changes\n%s\n" "$OTHERS"; fi
               fi
             fi
 
