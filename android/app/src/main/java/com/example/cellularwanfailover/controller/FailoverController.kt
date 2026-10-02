@@ -14,6 +14,7 @@ import com.example.cellularwanfailover.network.CellularNetworkManager
 import com.example.cellularwanfailover.network.NetworkUtils
 import com.example.cellularwanfailover.network.TrustedNetworkManager
 import com.example.cellularwanfailover.network.WifiTrustMonitor
+import com.wireguard.crypto.Key
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -103,9 +104,6 @@ class FailoverController private constructor(
     override val wireguardPeerIp: String
         get() = WireGuardManager.TUNNEL_PI_IP
 
-    override fun getWireguardConfigString(): String =
-        wireGuardManager.generatePiWgQuickConfig(_wifiIp.value ?: "10.20.0.X")
-
     init {
         // Forward logs from components
         wireGuardManager.onLog = { msg, isErr -> logEvent("WireGuard", msg, isErr) }
@@ -121,6 +119,7 @@ class FailoverController private constructor(
 
     private var isServiceRunning = false
     private var trustObservationJob: Job? = null
+    private var httpBindJob: Job? = null
 
     fun startServiceComponents() {
         if (isServiceRunning) return
@@ -146,10 +145,10 @@ class FailoverController private constructor(
         val ssid = wifiTrustMonitor.currentWifiInfo.value?.ssid ?: "Wi-Fi"
         logEvent("FailoverController", "Connected to trusted network ($ssid). Starting gateway services...")
 
-        try {
-            httpServer.start()
-        } catch (e: Exception) {
-            logEvent("FailoverController", "Failed to start HTTP server: ${e.message}", true)
+        // Keep the HTTP server bound to the current Wi-Fi IP only (rebinds on DHCP changes)
+        httpBindJob?.cancel()
+        httpBindJob = scope.launch(Dispatchers.IO) {
+            _wifiIp.collect { ip -> rebindHttpServer(ip) }
         }
 
         try {
@@ -161,10 +160,29 @@ class FailoverController private constructor(
         startMonitoringLoop()
     }
 
+    private fun rebindHttpServer(ip: String?) {
+        if (ip != null && httpServer.isRunning && httpServer.bindAddress == ip) return
+
+        if (httpServer.isRunning) {
+            httpServer.stop()
+        }
+        if (ip == null) {
+            logEvent("FailoverController", "No Wi-Fi IP address: HTTP server paused until one is assigned")
+            return
+        }
+        try {
+            httpServer.start(ip)
+        } catch (e: Exception) {
+            logEvent("FailoverController", "Failed to start HTTP server on $ip: ${e.message}", true)
+        }
+    }
+
     private fun pauseGatewayServices() {
         logEvent("FailoverController", "Untrusted network or mobile data alone. Halting gateway services (Paused)...")
         monitorJob?.cancel()
         monitorJob = null
+        httpBindJob?.cancel()
+        httpBindJob = null
 
         broadcaster.stop()
         httpServer.stop()
@@ -207,16 +225,24 @@ class FailoverController private constructor(
         refreshWifiIp()
     }
 
-    override suspend fun startFailover(): Boolean {
+    override suspend fun startFailover(gatewayPublicKey: Key): Boolean {
         mutex.withLock {
             if (!wifiTrustMonitor.isNetworkTrusted.value) {
                 logEvent("FailoverController", "Cannot start failover: untrusted network or mobile data alone", true)
                 return false
             }
 
+            val bindAddress = _wifiIp.value ?: NetworkUtils.getWifiIpAddress(appContext)
+            if (bindAddress == null) {
+                logEvent("FailoverController", "Cannot start failover: no Wi-Fi IP address to bind the relay to", true)
+                return false
+            }
+
             if (_failoverState.value == FailoverState.ACTIVE) {
-                logEvent("FailoverController", "Cellular failover relay is already active")
-                return true
+                // The gateway generates a new key on every activation (e.g. after a restart),
+                // so restart the relay with the new peer key; cellular stays up.
+                logEvent("FailoverController", "Relay already active: restarting it with the new gateway key")
+                wireGuardManager.stop()
             }
 
             _failoverState.value = FailoverState.CONNECTING
@@ -227,7 +253,7 @@ class FailoverController private constructor(
                 logEvent("FailoverController", "Cellular connected ($network). Starting WireGuard tunnel on :51820...")
 
                 try {
-                    wireGuardManager.start(network.networkHandle)
+                    wireGuardManager.start(gatewayPublicKey, bindAddress, network.networkHandle)
                     logEvent("FailoverController", "WireGuard tunnel active on :51820 (userspace)")
                 } catch (e: Exception) {
                     logEvent("FailoverController", "WireGuard startup error: ${e.message}", true)

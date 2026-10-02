@@ -9,6 +9,7 @@ object WgRelay {
         port: Int,
         privKeyBase64: String,
         peerPubKeyBase64: String,
+        bindAddress: String,
         netHandle: Long
     ): Int
 

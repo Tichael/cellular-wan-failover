@@ -29,7 +29,6 @@ class FailoverForegroundService : Service() {
 
         const val ACTION_START = "com.example.cellularwanfailover.action.START"
         const val ACTION_STOP = "com.example.cellularwanfailover.action.STOP"
-        const val ACTION_START_FAILOVER = "com.example.cellularwanfailover.action.START_FAILOVER"
         const val ACTION_STOP_FAILOVER = "com.example.cellularwanfailover.action.STOP_FAILOVER"
 
         fun startService(context: Context) {
@@ -68,11 +67,6 @@ class FailoverForegroundService : Service() {
                 return START_NOT_STICKY
             }
 
-            ACTION_START_FAILOVER -> {
-                scope.launch {
-                    controller.startFailover()
-                }
-            }
             ACTION_STOP_FAILOVER -> {
                 scope.launch {
                     controller.stopFailover()
@@ -150,28 +144,17 @@ class FailoverForegroundService : Service() {
             .setContentIntent(contentIntent)
 
         // Add action buttons
-        if (isTrusted) {
-            if (state == FailoverState.ACTIVE) {
-                val stopFailoverIntent = PendingIntent.getService(
-                    this,
-                    1,
-                    Intent(this, FailoverForegroundService::class.java).apply {
-                        action = ACTION_STOP_FAILOVER
-                    },
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-                builder.addAction(android.R.drawable.ic_media_pause, "Stop Failover", stopFailoverIntent)
-            } else {
-                val startFailoverIntent = PendingIntent.getService(
-                    this,
-                    2,
-                    Intent(this, FailoverForegroundService::class.java).apply {
-                        action = ACTION_START_FAILOVER
-                    },
-                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-                )
-                builder.addAction(android.R.drawable.ic_media_play, "Start Failover", startFailoverIntent)
-            }
+        // Failover is started by the gateway; the phone can only stop it
+        if (isTrusted && state == FailoverState.ACTIVE) {
+            val stopFailoverIntent = PendingIntent.getService(
+                this,
+                1,
+                Intent(this, FailoverForegroundService::class.java).apply {
+                    action = ACTION_STOP_FAILOVER
+                },
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            builder.addAction(android.R.drawable.ic_media_pause, "Stop Failover", stopFailoverIntent)
         }
 
         val stopServiceIntent = PendingIntent.getService(
