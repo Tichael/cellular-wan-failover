@@ -2,8 +2,6 @@ package main
 
 import (
 	"encoding/binary"
-	"fmt"
-	"net"
 	"os"
 	"sync/atomic"
 
@@ -120,7 +118,6 @@ func (t *NetTun) Write(bufs [][]byte, offset int) (int, error) {
 			// Fast path for ICMP Echo (Ping) when cellular is active
 			if isCellularReady() && proto == 1 {
 				if reply := handleICMPEcho(packet); reply != nil {
-					androidLog(fmt.Sprintf("handleICMPEcho: Echo Reply to %s", net.IP(packet[12:16])))
 					select {
 					case t.incomingPacket <- reply:
 					case <-t.closeCh:
@@ -137,7 +134,6 @@ func (t *NetTun) Write(bufs [][]byte, offset int) (int, error) {
 					srcPort := binary.BigEndian.Uint16(packet[ihl : ihl+2])
 					dstPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
 					RecordNat(proto, srcIP, srcPort, dstIP, dstPort)
-					androidLog(fmt.Sprintf("DNAT TCP %s:%d -> %s:%d", net.IP(srcIP[:]), srcPort, net.IP(dstIP[:]), dstPort))
 
 					copy(packet[16:20], []byte{10, 100, 0, 1})
 					updateIPv4Checksum(packet, ihl)
@@ -146,7 +142,6 @@ func (t *NetTun) Write(bufs [][]byte, offset int) (int, error) {
 					srcPort := binary.BigEndian.Uint16(packet[ihl : ihl+2])
 					dstPort := binary.BigEndian.Uint16(packet[ihl+2 : ihl+4])
 					RecordNat(proto, srcIP, srcPort, dstIP, dstPort)
-					androidLog(fmt.Sprintf("DNAT UDP %s:%d -> %s:%d", net.IP(srcIP[:]), srcPort, net.IP(dstIP[:]), dstPort))
 
 					copy(packet[16:20], []byte{10, 100, 0, 1})
 					updateIPv4Checksum(packet, ihl)

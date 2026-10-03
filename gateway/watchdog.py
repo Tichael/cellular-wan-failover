@@ -601,6 +601,8 @@ def main():
 
     # Main monitoring loop
     failed_probes = 0
+    # Last reported egress state while failover is active ("wan2" / "waiting"), to log changes only
+    active_state: str | None = None
     success_probes = 0
     running = True
 
@@ -639,6 +641,7 @@ def main():
         while running:
             if coordinator.active:
                 if coordinator.tunnel_lost():
+                    active_state = None
                     # The phone carrying the failover stopped answering through the tunnel
                     if check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout):
                         logger.info("Tunnel lost but WAN 1 is reachable: ending cellular failover")
@@ -658,15 +661,18 @@ def main():
                     is_wan2_active = check_tunnel_canary(args.primary_iface, args.canary_ip, timeout=args.ping_timeout)
                     if is_wan2_active:
                         success_probes = 0
-                        logger.info(
-                            f"WAN 2 active: LAN traffic routed via backup cellular ({args.failover_iface}). "
-                            f"Standby for primary WAN recovery..."
-                        )
+                        if active_state != "wan2":
+                            logger.info(
+                                f"WAN 2 active: LAN traffic routed via backup cellular ({args.failover_iface}). "
+                                f"Standby for primary WAN recovery..."
+                            )
+                            active_state = "wan2"
                     else:
                         # Canary timed out! Outbound traffic is no longer going out WAN 2.
                         # Verify if primary WAN 1 is healthy and passing traffic to public targets.
                         wan1_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
                         if wan1_ok:
+                            active_state = None
                             success_probes += 1
                             logger.info(
                                 f"WAN 1 probe ({args.primary_iface}): Direct via Primary "
@@ -681,9 +687,11 @@ def main():
                                 logger.info("Failback to WAN 1 completed successfully.")
                         else:
                             success_probes = 0
-                            logger.warning(
-                                f"WAN probe failed: router left WAN 2, but primary WAN ({args.primary_iface}) still unreachable"
-                            )
+                            if active_state != "waiting":
+                                logger.warning(
+                                    f"Router is not using WAN 2, but primary WAN ({args.primary_iface}) is still unreachable"
+                                )
+                                active_state = "waiting"
                 # else: tunnel probe failing, wait for the next probes before deciding
             else:
                 wan_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
@@ -696,6 +704,7 @@ def main():
                         logger.error("!!! WAN 1 OUTAGE DETECTED !!! Activating cellular failover...")
                         if coordinator.activate():
                             failed_probes = 0
+                            active_state = None
                             logger.info(">>> Cellular WAN 2 Failover 100% OPERATIONAL. Router routes traffic via smartphone. <<<")
                 else:
                     failed_probes = 0

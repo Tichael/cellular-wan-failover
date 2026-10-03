@@ -127,7 +127,6 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifi
 		} else {
 			destAddr = net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 		}
-		androidLog(fmt.Sprintf("TCP request from %s to %s", id.RemoteAddress, destAddr))
 
 		var wq waiter.Queue
 		clientEP, epErr := r.CreateEndpoint(&wq)
@@ -154,7 +153,6 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifi
 		} else {
 			destAddr = net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
 		}
-		androidLog(fmt.Sprintf("UDP request from %s to %s", id.RemoteAddress, destAddr))
 
 		var wq waiter.Queue
 		clientEP, epErr := r.CreateEndpoint(&wq)
@@ -170,7 +168,8 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifi
 
 	// WireGuard device
 	netTun := NewNetTun(ep, 1420)
-	logger := device.NewLogger(device.LogLevelVerbose, "[wgrelay] ")
+	// Errors only: logs describe what the relay does, not the traffic going through it
+	logger := device.NewLogger(device.LogLevelError, "[wgrelay] ")
 	dev := device.NewDevice(netTun, bind, logger)
 
 	uapiConfig := fmt.Sprintf(
@@ -208,7 +207,6 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifi
 func handleTCPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
 	defer clientConn.Close()
 
-	androidLog(fmt.Sprintf("TCP dialing %s (netHandle=%d)...", destAddr, netHandle))
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -218,11 +216,9 @@ func handleTCPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
 
 	remoteConn, err := dialer.Dial("tcp", destAddr)
 	if err != nil {
-		androidLog(fmt.Sprintf("TCP dial %s failed: %v", destAddr, err))
 		return
 	}
 	defer remoteConn.Close()
-	androidLog(fmt.Sprintf("TCP connected to %s", destAddr))
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -243,13 +239,11 @@ func handleTCPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
 		}
 	}()
 	wg.Wait()
-	androidLog(fmt.Sprintf("TCP session %s closed", destAddr))
 }
 
 func handleUDPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
 	defer clientConn.Close()
 
-	androidLog(fmt.Sprintf("UDP dialing %s (netHandle=%d)...", destAddr, netHandle))
 	dialer := &net.Dialer{
 		Timeout: 10 * time.Second,
 		Control: func(network, address string, c syscall.RawConn) error {
@@ -259,11 +253,9 @@ func handleUDPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
 
 	remoteConn, err := dialer.Dial("udp", destAddr)
 	if err != nil {
-		androidLog(fmt.Sprintf("UDP dial %s failed: %v", destAddr, err))
 		return
 	}
 	defer remoteConn.Close()
-	androidLog(fmt.Sprintf("UDP connected to %s", destAddr))
 
 	done := make(chan struct{}, 2)
 	buf1 := make([]byte, 65535)
@@ -304,7 +296,6 @@ func handleUDPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
 	}()
 
 	<-done
-	androidLog(fmt.Sprintf("UDP session %s closed", destAddr))
 }
 
 func StopRelay() {

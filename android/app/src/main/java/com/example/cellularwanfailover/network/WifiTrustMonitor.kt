@@ -75,7 +75,6 @@ class WifiTrustMonitor(
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                Log.d(TAG, "Wi-Fi network capabilities changed: $network")
                 updateFromCapabilities(network, networkCapabilities)
             }
 
