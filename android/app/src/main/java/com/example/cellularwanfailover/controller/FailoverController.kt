@@ -119,7 +119,8 @@ class FailoverController private constructor(
 
     private var isServiceRunning = false
     private var trustObservationJob: Job? = null
-    private var httpBindJob: Job? = null
+    private val httpServerLock = Any()
+    private var lastHttpBindError: String? = null
 
     fun startServiceComponents() {
         if (isServiceRunning) return
@@ -145,11 +146,8 @@ class FailoverController private constructor(
         val ssid = wifiTrustMonitor.currentWifiInfo.value?.ssid ?: "Wi-Fi"
         logEvent("FailoverController", "Connected to trusted network ($ssid). Starting gateway services...")
 
-        // Keep the HTTP server bound to the current Wi-Fi IP only (rebinds on DHCP changes)
-        httpBindJob?.cancel()
-        httpBindJob = scope.launch(Dispatchers.IO) {
-            _wifiIp.collect { ip -> rebindHttpServer(ip) }
-        }
+        // Bound to the current Wi-Fi IP only; the monitoring loop keeps it in sync
+        ensureHttpServer()
 
         try {
             broadcaster.start()
@@ -160,20 +158,31 @@ class FailoverController private constructor(
         startMonitoringLoop()
     }
 
-    private fun rebindHttpServer(ip: String?) {
-        if (ip != null && httpServer.isRunning && httpServer.bindAddress == ip) return
+    /**
+     * Keeps the HTTP server listening on the current Wi-Fi IP while the service runs on a
+     * trusted network: starts it, rebinds it after an IP change, and retries failed starts.
+     */
+    private fun ensureHttpServer() {
+        synchronized(httpServerLock) {
+            val ip = _wifiIp.value
+            val shouldRun = isServiceRunning && wifiTrustMonitor.isNetworkTrusted.value && ip != null
+            if (!shouldRun) {
+                if (httpServer.isRunning) httpServer.stop()
+                return
+            }
+            if (httpServer.isRunning && httpServer.bindAddress == ip) return
 
-        if (httpServer.isRunning) {
-            httpServer.stop()
-        }
-        if (ip == null) {
-            logEvent("FailoverController", "No Wi-Fi IP address: HTTP server paused until one is assigned")
-            return
-        }
-        try {
-            httpServer.start(ip)
-        } catch (e: Exception) {
-            logEvent("FailoverController", "Failed to start HTTP server on $ip: ${e.message}", true)
+            if (httpServer.isRunning) httpServer.stop()
+            try {
+                httpServer.start(ip!!)
+                lastHttpBindError = null
+            } catch (e: Exception) {
+                val error = "$ip: ${e.message}"
+                if (error != lastHttpBindError) {
+                    logEvent("FailoverController", "Failed to start HTTP server on $error (retrying)", true)
+                    lastHttpBindError = error
+                }
+            }
         }
     }
 
@@ -181,11 +190,11 @@ class FailoverController private constructor(
         logEvent("FailoverController", "Untrusted network or mobile data alone. Halting gateway services (Paused)...")
         monitorJob?.cancel()
         monitorJob = null
-        httpBindJob?.cancel()
-        httpBindJob = null
 
         broadcaster.stop()
-        httpServer.stop()
+        synchronized(httpServerLock) {
+            httpServer.stop()
+        }
 
         scope.launch {
             stopFailover()
@@ -316,6 +325,7 @@ class FailoverController private constructor(
             while (isActive) {
                 // Update Wi-Fi IP and transmitted bytes counter
                 refreshWifiIp()
+                ensureHttpServer()
                 wireGuardManager.updateStatistics()
                 _bytesTransmitted.value = wireGuardManager.bytesTransmitted.get()
                 delay(2000L)

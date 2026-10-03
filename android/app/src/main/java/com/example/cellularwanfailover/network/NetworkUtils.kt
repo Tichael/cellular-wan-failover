@@ -10,13 +10,22 @@ import java.net.NetworkInterface
 object NetworkUtils {
     private const val TAG = "NetworkUtils"
 
+    /**
+     * A real Wi-Fi network, not a VPN. VPNs (including ones running in another
+     * profile, e.g. a work profile) report their underlying transport, so they
+     * also match TRANSPORT_WIFI.
+     */
+    private fun isPhysicalWifi(caps: NetworkCapabilities): Boolean =
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+
     fun getWifiIpAddress(context: Context): String? {
         try {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
             if (cm != null) {
                 for (network in cm.allNetworks) {
                     val caps = cm.getNetworkCapabilities(network) ?: continue
-                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    if (isPhysicalWifi(caps)) {
                         val lp = cm.getLinkProperties(network) ?: continue
                         for (linkAddr in lp.linkAddresses) {
                             val addr = linkAddr.address
@@ -46,19 +55,6 @@ object NetworkUtils {
                     }
                 }
             }
-
-            // General non-loopback fallback if name didn't match
-            val allInterfaces = NetworkInterface.getNetworkInterfaces() ?: return null
-            for (intf in allInterfaces) {
-                if (intf.isLoopback || !intf.isUp || intf.name.startsWith("rmnet") || intf.name.startsWith("dummy")) {
-                    continue
-                }
-                for (addr in intf.inetAddresses) {
-                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                        return addr.hostAddress
-                    }
-                }
-            }
         } catch (e: Exception) {
             Log.e(TAG, "Error inspecting NetworkInterfaces for IP", e)
         }
@@ -84,7 +80,7 @@ object NetworkUtils {
             if (cm != null) {
                 for (network in cm.allNetworks) {
                     val caps = cm.getNetworkCapabilities(network) ?: continue
-                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    if (isPhysicalWifi(caps)) {
                         var ssid: String? = null
                         var bssid: String? = null
                         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
