@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from watchdog import (
     AndroidFailoverClient,
+    FailoverCoordinator,
     PhoneDiscovery,
     RoutingManager,
     activate_failover,
@@ -116,6 +117,26 @@ class TestPhoneDiscovery:
         assert discovery._running is True
         discovery.stop()
         assert discovery._running is False
+
+    def test_tracks_multiple_phones_most_recent_first(self):
+        discovery = PhoneDiscovery(port=18990, max_age=15.0)
+        discovery.record_phone("10.20.0.10", {"device": "Pixel A"}, now=100.0)
+        discovery.record_phone("10.20.0.11", {"device": "Pixel B"}, now=103.0)
+        assert discovery.get_available_phones(now=104.0) == ["10.20.0.11", "10.20.0.10"]
+        assert discovery.get_phone_ip() == "10.20.0.11"
+
+    def test_silent_phone_becomes_unavailable(self):
+        discovery = PhoneDiscovery(port=18990, max_age=15.0)
+        discovery.record_phone("10.20.0.10", {"device": "Pixel A"}, now=100.0)
+        discovery.record_phone("10.20.0.11", {"device": "Pixel B"}, now=110.0)
+        # Phone A stopped broadcasting (battery, crash, out of range)
+        assert discovery.get_available_phones(now=120.0) == ["10.20.0.11"]
+
+    def test_static_phone_always_available(self):
+        discovery = PhoneDiscovery(port=18990, initial_ip="10.20.0.99", max_age=15.0)
+        assert discovery.get_available_phones(now=1000.0) == ["10.20.0.99"]
+        discovery.record_phone("10.20.0.10", {"device": "Pixel A"}, now=1000.0)
+        assert discovery.get_available_phones(now=1001.0) == ["10.20.0.10", "10.20.0.99"]
 
 
 class TestNetworkProbes:
@@ -301,6 +322,107 @@ class TestWireGuardConfig:
         routing.setup_wireguard_interface.assert_not_called()
 
 
+class FakeDiscovery:
+    def __init__(self, phones):
+        self.phones = list(phones)
+
+    def get_available_phones(self):
+        return list(self.phones)
+
+
+class TestFailoverCoordinator:
+    def make(self, phones, failing_phones=()):
+        clients = {}
+
+        def factory(phone_ip, http_port):
+            client = clients.setdefault(phone_ip, MagicMock(name=phone_ip))
+            client.phone_ip = phone_ip
+            return client
+
+        def fake_activate(client, routing):
+            if client.phone_ip in failing_phones:
+                raise ConnectionError(f"{client.phone_ip} unreachable")
+            return {"result": "active"}
+
+        routing = MagicMock()
+        coordinator = FailoverCoordinator(
+            discovery=FakeDiscovery(phones), routing=routing, tunnel_fail_threshold=3, client_factory=factory
+        )
+        return coordinator, routing, clients, fake_activate
+
+    def test_activate_uses_first_available_phone(self):
+        coordinator, _, _, fake_activate = self.make(["10.20.0.10", "10.20.0.11"])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            assert coordinator.activate() is True
+        assert coordinator.active_phone_ip == "10.20.0.10"
+
+    def test_activate_falls_back_to_next_phone(self):
+        coordinator, routing, clients, fake_activate = self.make(["10.20.0.10", "10.20.0.11"], failing_phones={"10.20.0.10"})
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            assert coordinator.activate() is True
+        assert coordinator.active_phone_ip == "10.20.0.11"
+        # Partial state from the failed attempt was cleaned up
+        routing.teardown_wireguard_interface.assert_called()
+        clients["10.20.0.10"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
+
+    def test_activate_without_phones(self):
+        coordinator, _, _, fake_activate = self.make([])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            assert coordinator.activate() is False
+        assert coordinator.active is False
+
+    @patch("watchdog.check_tunnel_canary", return_value=False)
+    def test_tunnel_lost_after_threshold(self, _canary):
+        coordinator, _, _, fake_activate = self.make(["10.20.0.10"])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            coordinator.activate()
+        assert coordinator.tunnel_lost() is False
+        assert coordinator.tunnel_lost() is False
+        assert coordinator.tunnel_lost() is True
+
+    def test_tunnel_success_resets_failures(self):
+        coordinator, _, _, fake_activate = self.make(["10.20.0.10"])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            coordinator.activate()
+        with patch("watchdog.check_tunnel_canary", side_effect=[False, False, True, False, False]):
+            assert [coordinator.tunnel_lost() for _ in range(5)] == [False, False, False, False, False]
+
+    def test_hand_over_prefers_another_phone(self):
+        coordinator, _, clients, fake_activate = self.make(["10.20.0.10", "10.20.0.11"])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            coordinator.activate()
+            assert coordinator.active_phone_ip == "10.20.0.10"
+            assert coordinator.hand_over() is True
+        assert coordinator.active_phone_ip == "10.20.0.11"
+        # Lost phone was asked (best effort) to release cellular
+        clients["10.20.0.10"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
+
+    def test_hand_over_retries_same_phone_when_alone(self):
+        # e.g. the app restarted: the same phone comes back with a fresh relay
+        coordinator, _, _, fake_activate = self.make(["10.20.0.10"])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            coordinator.activate()
+            assert coordinator.hand_over() is True
+        assert coordinator.active_phone_ip == "10.20.0.10"
+
+    def test_hand_over_fails_when_no_phone_left(self):
+        coordinator, routing, _, fake_activate = self.make(["10.20.0.10"])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            coordinator.activate()
+            coordinator.discovery.phones = []
+            assert coordinator.hand_over() is False
+        assert coordinator.active is False
+        routing.disable_routing_and_nat.assert_called()
+
+    def test_release_tolerates_unreachable_phone(self):
+        coordinator, _, clients, fake_activate = self.make(["10.20.0.10"])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            coordinator.activate()
+        clients["10.20.0.10"].stop_failover.side_effect = ConnectionError("gone")
+        coordinator.deactivate()
+        assert coordinator.active is False
+
+
 class TestArgParsing:
     def test_default_arguments(self):
         args = parse_args([])
@@ -318,6 +440,7 @@ class TestArgParsing:
         assert args.fail_threshold == 3
         assert args.restore_threshold == 5
         assert args.check_interval == 5
+        assert args.tunnel_fail_threshold == 3
 
     def test_custom_arguments(self):
         args = parse_args([

@@ -68,6 +68,7 @@ func Java_com_example_cellularwanfailover_wireguard_WgRelay_startRelay(
 	privKeyJ C.jstring,
 	peerPubKeyJ C.jstring,
 	bindAddrJ C.jstring,
+	wifiNetHandle C.jlong,
 	netHandle C.jlong,
 ) C.jint {
 	cPriv := C.get_jstring(env, privKeyJ)
@@ -88,7 +89,7 @@ func Java_com_example_cellularwanfailover_wireguard_WgRelay_startRelay(
 	peerKey := C.GoString(cPeer)
 	bindAddr := C.GoString(cBind)
 
-	err := StartRelay(int(port), privKey, peerKey, bindAddr, uint64(netHandle))
+	err := StartRelay(int(port), privKey, peerKey, bindAddr, uint64(wifiNetHandle), uint64(netHandle))
 	if err != nil {
 		androidLog(fmt.Sprintf("StartRelay error: %v", err))
 		return -1

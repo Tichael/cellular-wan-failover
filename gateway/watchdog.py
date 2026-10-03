@@ -41,19 +41,19 @@ class AndroidFailoverClient:
     def base_url(self) -> str:
         return f"http://{self.phone_ip}:{self.http_port}"
 
-    def _request(self, path: str, method: str = "GET", data: bytes | None = None, timeout: float | None = None) -> str:
+    def _request(self, path: str, method: str = "GET", data: bytes | None = None, timeout: float | None = None, attempts: int = 3) -> str:
         url = f"{self.base_url}{path}"
         headers = {"User-Agent": "Cellular-WAN-Gateway/1.0"}
         if data:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, headers=headers, method=method)
         t = timeout or self.timeout
-        for attempt in range(3):
+        for attempt in range(attempts):
             try:
                 with urllib.request.urlopen(req, timeout=t) as resp:
                     return resp.read().decode("utf-8")
             except (urllib.error.URLError, ConnectionError, OSError) as e:
-                if attempt == 2:
+                if attempt == attempts - 1:
                     raise
                 time.sleep(0.5)
         return ""
@@ -65,17 +65,22 @@ class AndroidFailoverClient:
         body = json.dumps({"gateway_public_key": gateway_public_key}).encode("utf-8")
         return json.loads(self._request("/v1/failover/start", method="POST", data=body, timeout=15.0))
 
-    def stop_failover(self) -> dict:
-        return json.loads(self._request("/v1/failover/stop", method="POST", data=b"", timeout=10.0))
+    def stop_failover(self, timeout: float = 10.0, attempts: int = 3) -> dict:
+        return json.loads(self._request("/v1/failover/stop", method="POST", data=b"", timeout=timeout, attempts=attempts))
 
 
 class PhoneDiscovery:
-    """Background UDP listener to discover and keep track of smartphone IP."""
+    """Background UDP listener that keeps track of every smartphone broadcasting on the LAN."""
 
-    def __init__(self, port: int = 8990, initial_ip: str | None = None):
+    def __init__(self, port: int = 8990, initial_ip: str | None = None, max_age: float = 15.0):
         self.port = port
+        self.static_ip = initial_ip
+        # A phone is available while its broadcasts (every 5s) keep arriving
+        self.max_age = max_age
+        # Most recently seen phone (used by the one-shot CLI actions)
         self.phone_ip = initial_ip
         self.device_info: dict[str, object] = {}
+        self._phones: dict[str, dict[str, object]] = {}
         self._running = False
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -91,6 +96,27 @@ class PhoneDiscovery:
     def get_phone_ip(self) -> str | None:
         with self._lock:
             return self.phone_ip
+
+    def record_phone(self, ip: str, payload: dict, now: float | None = None):
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            previous = self._phones.get(ip)
+            if previous is None or now - previous["last_seen"] > self.max_age:
+                device_name = payload.get("device", "Android Device")
+                logger.info(f"[Discovery] Smartphone detected: {device_name} ({ip})")
+            self._phones[ip] = {"info": payload, "last_seen": now}
+            self.phone_ip = ip
+            self.device_info = payload
+
+    def get_available_phones(self, now: float | None = None) -> list[str]:
+        """Phones heard within max_age, most recently seen first. A static PHONE_IP is always included."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            fresh = [ip for ip, p in self._phones.items() if now - p["last_seen"] <= self.max_age]
+            fresh.sort(key=lambda ip: self._phones[ip]["last_seen"], reverse=True)
+        if self.static_ip and self.static_ip not in fresh:
+            fresh.append(self.static_ip)
+        return fresh
 
     def _listen_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -112,13 +138,7 @@ class PhoneDiscovery:
                     try:
                         payload = json.loads(data.decode("utf-8"))
                         if payload.get("service") == "wan-failover" or "device" in payload:
-                            discovered_ip = addr[0]
-                            with self._lock:
-                                if self.phone_ip != discovered_ip:
-                                    device_name = payload.get("device", "Android Device")
-                                    logger.info(f"[Discovery] Smartphone detected: {device_name} ({discovered_ip})")
-                                self.phone_ip = discovered_ip
-                                self.device_info = payload
+                            self.record_phone(addr[0], payload)
                     except Exception as parse_err:
                         logger.debug(f"[Discovery] Error parsing UDP packet from {addr}: {parse_err}")
             except Exception:
@@ -166,6 +186,9 @@ class RoutingManager:
 
         logger.info(f"Bringing up WireGuard ({self.wg_iface})...")
         self._run(["wg-quick", "up", conf_path], check=True)
+        # Loose reverse-path filtering: replies arrive on wg0 from internet sources whose
+        # main-table route points at the primary interface (Table = off)
+        self._run(["sysctl", "-w", f"net.ipv4.conf.{self.wg_iface}.rp_filter=2"])
         logger.info(f"Interface {self.wg_iface} active.")
 
     def teardown_wireguard_interface(self):
@@ -324,6 +347,107 @@ def activate_failover(client: "AndroidFailoverClient", routing: "RoutingManager"
     return res
 
 
+class FailoverCoordinator:
+    """
+    Owns the active failover: which smartphone carries it, whether its tunnel still
+    answers, and handing it over to another phone when it is lost (app crash, empty
+    battery, out of Wi-Fi range...). Several phones may be available (e.g. a family's).
+    """
+
+    def __init__(
+        self,
+        discovery: "PhoneDiscovery",
+        routing: "RoutingManager",
+        http_port: int = 8989,
+        wg_iface: str = "wg0",
+        canary_ip: str = "198.18.0.1",
+        ping_timeout: int = 2,
+        tunnel_fail_threshold: int = 3,
+        client_factory=None,
+    ):
+        self.discovery = discovery
+        self.routing = routing
+        self.http_port = http_port
+        self.wg_iface = wg_iface
+        self.canary_ip = canary_ip
+        self.ping_timeout = ping_timeout
+        self.tunnel_fail_threshold = tunnel_fail_threshold
+        self.client_factory = client_factory or AndroidFailoverClient
+        self.active_phone_ip: str | None = None
+        self.tunnel_failures = 0
+
+    @property
+    def active(self) -> bool:
+        return self.active_phone_ip is not None
+
+    def _client(self, ip: str) -> "AndroidFailoverClient":
+        return self.client_factory(phone_ip=ip, http_port=self.http_port)
+
+    def _release_phone(self, ip: str):
+        """Best effort: the phone may be gone, so don't wait on it."""
+        try:
+            res = self._client(ip).stop_failover(timeout=3.0, attempts=1)
+            logger.info(f"Smartphone {ip} returned to standby: {res}")
+        except Exception as e:
+            logger.warning(f"Could not put smartphone {ip} back to standby: {e}")
+
+    def _teardown_local(self):
+        self.routing.disable_routing_and_nat()
+        self.routing.teardown_wireguard_interface()
+
+    def activate(self, avoid: str | None = None) -> bool:
+        """Starts failover on the first available phone that succeeds. [avoid] (a phone just lost) is tried last."""
+        candidates = self.discovery.get_available_phones()
+        if avoid in candidates:
+            candidates = [ip for ip in candidates if ip != avoid] + [avoid]
+        if not candidates:
+            logger.error("Cannot activate failover: no smartphone available")
+            return False
+
+        for ip in candidates:
+            try:
+                activate_failover(self._client(ip), self.routing)
+            except Exception as e:
+                logger.error(f"Failover activation via smartphone {ip} failed: {e}")
+                self._teardown_local()
+                self._release_phone(ip)
+                continue
+            self.active_phone_ip = ip
+            self.tunnel_failures = 0
+            logger.info(f"Failover active via smartphone {ip}")
+            return True
+        return False
+
+    def deactivate(self):
+        self._teardown_local()
+        if self.active_phone_ip:
+            self._release_phone(self.active_phone_ip)
+        self.active_phone_ip = None
+        self.tunnel_failures = 0
+
+    def tunnel_lost(self) -> bool:
+        """
+        Probes the canary IP through the tunnel itself; only the phone's relay answers it.
+        Returns True once [tunnel_fail_threshold] consecutive probes have failed.
+        """
+        if check_tunnel_canary(self.wg_iface, self.canary_ip, timeout=self.ping_timeout):
+            self.tunnel_failures = 0
+            return False
+        self.tunnel_failures += 1
+        logger.warning(
+            f"Tunnel probe to smartphone {self.active_phone_ip} via {self.wg_iface} failed "
+            f"({self.tunnel_failures}/{self.tunnel_fail_threshold})"
+        )
+        return self.tunnel_failures >= self.tunnel_fail_threshold
+
+    def hand_over(self) -> bool:
+        """Moves failover off the lost phone, preferring another one; retrying the same phone re-keys a restarted relay."""
+        lost = self.active_phone_ip
+        logger.error(f"!!! Smartphone {lost} lost: handing failover over to another smartphone... !!!")
+        self.deactivate()
+        return self.activate(avoid=lost)
+
+
 def check_tunnel_canary(iface: str, canary_ip: str = "198.18.0.1", timeout: int = 2) -> bool:
     """
     Sends an ICMP Echo Request to a non-routable canary IP (RFC 2544 benchmark range).
@@ -370,6 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--canary-ip", default=os.environ.get("CANARY_IP", "198.18.0.1"), help="Non-routable RFC 2544 canary IP synthesized only by tunnel (default: 198.18.0.1)")
     parser.add_argument("--fail-threshold", type=int, default=int(os.environ.get("FAIL_THRESHOLD", "3")), help="Consecutive failures before failover")
     parser.add_argument("--restore-threshold", type=int, default=int(os.environ.get("RESTORE_THRESHOLD", "5")), help="Consecutive successes before failback")
+    parser.add_argument("--tunnel-fail-threshold", type=int, default=int(os.environ.get("TUNNEL_FAIL_THRESHOLD", "3")), help="Consecutive failed tunnel probes before the phone is considered lost and failover is handed over")
     parser.add_argument("--check-interval", type=int, default=int(os.environ.get("CHECK_INTERVAL", "5")), help="Health check interval in seconds")
     parser.add_argument("--discover-only", action="store_true", help="Print discovered smartphone IP and exit")
     parser.add_argument("--status-only", action="store_true", help="Print smartphone status and exit")
@@ -394,6 +519,16 @@ def main():
         wg_iface=args.wg_iface,
         table_id=args.table_id,
         clamp_mss=args.clamp_mss,
+    )
+
+    coordinator = FailoverCoordinator(
+        discovery=discovery,
+        routing=routing,
+        http_port=args.http_port,
+        wg_iface=args.wg_iface,
+        canary_ip=args.canary_ip,
+        ping_timeout=args.ping_timeout,
+        tunnel_fail_threshold=args.tunnel_fail_threshold,
     )
 
     def get_client() -> AndroidFailoverClient:
@@ -443,24 +578,28 @@ def main():
         return
 
     if args.start_now:
-        client = get_client()
-        activate_failover(client, routing)
-        logger.info("Cellular failover manually activated successfully.")
+        get_client()  # waits for a first smartphone
+        activated = coordinator.activate()
         discovery.stop()
+        if not activated:
+            sys.exit(1)
+        logger.info("Cellular failover manually activated successfully.")
         return
 
     if args.stop_now:
-        client = get_client()
-        logger.info(f"Manual deactivation on {client.phone_ip}...")
+        get_client()  # waits for a first smartphone
+        # Listen one more broadcast interval so every phone (only one carries the failover) is known
+        time.sleep(6)
         routing.disable_routing_and_nat()
         routing.teardown_wireguard_interface()
-        client.stop_failover()
+        for ip in discovery.get_available_phones():
+            logger.info(f"Manual deactivation on {ip}...")
+            coordinator._release_phone(ip)
         logger.info("Cellular failover stopped.")
         discovery.stop()
         return
 
     # Main monitoring loop
-    failover_active = False
     failed_probes = 0
     success_probes = 0
     running = True
@@ -483,6 +622,7 @@ def main():
     logger.info(f"  - ICMP probe targets         : {', '.join(args.targets)} (timeout: {args.ping_timeout}s)")
     logger.info(f"  - Non-routable canary IP     : {args.canary_ip}")
     logger.info(f"  - Fail / restore thresholds  : {args.fail_threshold} failures / {args.restore_threshold} successes")
+    logger.info(f"  - Lost phone after           : {args.tunnel_fail_threshold} failed tunnel probes")
     logger.info(f"  - Health check interval      : {args.check_interval}s")
     logger.info("====================================================================")
 
@@ -497,54 +637,54 @@ def main():
 
     try:
         while running:
-            if failover_active:
-                # While failover is active, test the non-routable canary IP (198.18.0.1).
-                # If the router is still routing LAN default traffic through WAN 2,
-                # the canary probe reaches eth1 -> wg0 and is answered by the phone's relay.
-                is_wan2_active = check_tunnel_canary(args.primary_iface, args.canary_ip, timeout=args.ping_timeout)
-                if is_wan2_active:
-                    success_probes = 0
-                    logger.info(
-                        f"WAN 2 active: LAN traffic routed via backup cellular ({args.failover_iface}). "
-                        f"Standby for primary WAN recovery..."
-                    )
-                else:
-                    # Canary timed out! Outbound traffic is no longer going out WAN 2.
-                    # Verify if primary WAN 1 is healthy and passing traffic to public targets.
-                    wan1_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
-                    if wan1_ok:
-                        success_probes += 1
-                        logger.info(
-                            f"WAN 1 probe ({args.primary_iface}): Direct via Primary "
-                            f"({success_probes}/{args.restore_threshold})"
-                        )
-                        if success_probes >= args.restore_threshold:
-                            logger.info(">>> WAN 1 recovery confirmed! Tearing down cellular failover... <<<")
-                            current_phone_ip = discovery.get_phone_ip()
-
-                            # 1. Immediate NAT transit deactivation (router falls back to WAN 1 instantly)
-                            routing.disable_routing_and_nat()
-
-                            # 2. Tear down WireGuard tunnel
-                            routing.teardown_wireguard_interface()
-
-                            # 3. Release mobile cellular radio on smartphone
-                            if current_phone_ip:
-                                try:
-                                    client = AndroidFailoverClient(phone_ip=current_phone_ip, http_port=args.http_port)
-                                    res = client.stop_failover()
-                                    logger.info(f"Smartphone returned to standby: {res}")
-                                except Exception as e:
-                                    logger.warning(f"Error while putting smartphone to standby: {e}")
-
-                            failover_active = False
-                            success_probes = 0
-                            logger.info("Failback to WAN 1 completed successfully.")
+            if coordinator.active:
+                if coordinator.tunnel_lost():
+                    # The phone carrying the failover stopped answering through the tunnel
+                    if check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout):
+                        logger.info("Tunnel lost but WAN 1 is reachable: ending cellular failover")
+                        coordinator.deactivate()
+                        failed_probes = 0
+                    elif coordinator.hand_over():
+                        logger.info(f">>> Failover handed over to smartphone {coordinator.active_phone_ip}. <<<")
                     else:
+                        # Still in an outage: retry activation on the next failed WAN 1 probe
+                        logger.error("No smartphone could take over the failover; retrying on next probe")
+                        failed_probes = max(args.fail_threshold - 1, 0)
+                    success_probes = 0
+                elif coordinator.tunnel_failures == 0:
+                    # While failover is active, test the non-routable canary IP (198.18.0.1).
+                    # If the router is still routing LAN default traffic through WAN 2,
+                    # the canary probe reaches eth1 -> wg0 and is answered by the phone's relay.
+                    is_wan2_active = check_tunnel_canary(args.primary_iface, args.canary_ip, timeout=args.ping_timeout)
+                    if is_wan2_active:
                         success_probes = 0
-                        logger.warning(
-                            f"WAN probe failed: router left WAN 2, but primary WAN ({args.primary_iface}) still unreachable"
+                        logger.info(
+                            f"WAN 2 active: LAN traffic routed via backup cellular ({args.failover_iface}). "
+                            f"Standby for primary WAN recovery..."
                         )
+                    else:
+                        # Canary timed out! Outbound traffic is no longer going out WAN 2.
+                        # Verify if primary WAN 1 is healthy and passing traffic to public targets.
+                        wan1_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
+                        if wan1_ok:
+                            success_probes += 1
+                            logger.info(
+                                f"WAN 1 probe ({args.primary_iface}): Direct via Primary "
+                                f"({success_probes}/{args.restore_threshold})"
+                            )
+                            if success_probes >= args.restore_threshold:
+                                logger.info(">>> WAN 1 recovery confirmed! Tearing down cellular failover... <<<")
+                                # Routing/NAT off first (router falls back to WAN 1 instantly), then wg0,
+                                # then the phone releases its cellular radio
+                                coordinator.deactivate()
+                                success_probes = 0
+                                logger.info("Failback to WAN 1 completed successfully.")
+                        else:
+                            success_probes = 0
+                            logger.warning(
+                                f"WAN probe failed: router left WAN 2, but primary WAN ({args.primary_iface}) still unreachable"
+                            )
+                # else: tunnel probe failing, wait for the next probes before deciding
             else:
                 wan_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
                 if not wan_ok:
@@ -554,35 +694,18 @@ def main():
 
                     if failed_probes >= args.fail_threshold:
                         logger.error("!!! WAN 1 OUTAGE DETECTED !!! Activating cellular failover...")
-                        current_phone_ip = discovery.get_phone_ip()
-                        if not current_phone_ip:
-                            logger.error("Cannot activate failover: no smartphone reachable!")
-                        else:
-                            client = AndroidFailoverClient(phone_ip=current_phone_ip, http_port=args.http_port)
-                            try:
-                                activate_failover(client, routing)
-                                failover_active = True
-                                failed_probes = 0
-                                logger.info(">>> Cellular WAN 2 Failover 100% OPERATIONAL. Router routes traffic via smartphone. <<<")
-                            except Exception as e:
-                                logger.error(f"Error during failover activation: {e}")
+                        if coordinator.activate():
+                            failed_probes = 0
+                            logger.info(">>> Cellular WAN 2 Failover 100% OPERATIONAL. Router routes traffic via smartphone. <<<")
                 else:
                     failed_probes = 0
 
             time.sleep(args.check_interval)
 
     finally:
-        if failover_active:
+        if coordinator.active:
             logger.info("Service stopping: cleaning up routing and stopping smartphone relay...")
-            routing.disable_routing_and_nat()
-            routing.teardown_wireguard_interface()
-            current_phone_ip = discovery.get_phone_ip()
-            if current_phone_ip:
-                try:
-                    client = AndroidFailoverClient(phone_ip=current_phone_ip, http_port=args.http_port)
-                    client.stop_failover()
-                except Exception:
-                    pass
+            coordinator.deactivate()
         discovery.stop()
         logger.info("Watchdog stopped.")
 

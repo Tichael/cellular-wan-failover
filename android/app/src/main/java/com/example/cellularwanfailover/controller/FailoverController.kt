@@ -54,7 +54,11 @@ class FailoverController private constructor(
     val cellularManager = CellularNetworkManager(appContext)
     val wireGuardManager = WireGuardManager(appContext)
     val httpServer = ControlHttpServer(port = 8989, delegate = this)
-    val broadcaster = DiscoveryBroadcaster(httpPort = 8989, broadcastPort = 8990)
+    val broadcaster = DiscoveryBroadcaster(
+        httpPort = 8989,
+        broadcastPort = 8990,
+        wifiNetworkProvider = { NetworkUtils.getWifiNetwork(appContext) }
+    )
     val trustedNetworkManager = TrustedNetworkManager(appContext)
     val wifiTrustMonitor = WifiTrustMonitor(appContext, trustedNetworkManager)
 
@@ -241,9 +245,12 @@ class FailoverController private constructor(
                 return false
             }
 
-            val bindAddress = _wifiIp.value ?: NetworkUtils.getWifiIpAddress(appContext)
-            if (bindAddress == null) {
-                logEvent("FailoverController", "Cannot start failover: no Wi-Fi IP address to bind the relay to", true)
+            // The relay is bound to the Wi-Fi network so replies reach the gateway even when
+            // Wi-Fi has lost internet access and Android has made cellular the default network
+            val wifiNetwork = NetworkUtils.getWifiNetwork(appContext)
+            val bindAddress = wifiNetwork?.let { NetworkUtils.getIpv4Address(appContext, it) }
+            if (wifiNetwork == null || bindAddress == null) {
+                logEvent("FailoverController", "Cannot start failover: no Wi-Fi network to bind the relay to", true)
                 return false
             }
 
@@ -262,7 +269,7 @@ class FailoverController private constructor(
                 logEvent("FailoverController", "Cellular connected ($network). Starting WireGuard tunnel on :51820...")
 
                 try {
-                    wireGuardManager.start(gatewayPublicKey, bindAddress, network.networkHandle)
+                    wireGuardManager.start(gatewayPublicKey, bindAddress, wifiNetwork.networkHandle, network.networkHandle)
                     logEvent("FailoverController", "WireGuard tunnel active on :51820 (userspace)")
                 } catch (e: Exception) {
                     logEvent("FailoverController", "WireGuard startup error: ${e.message}", true)

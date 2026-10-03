@@ -50,7 +50,7 @@ func GetBytesTransmitted() int64 {
 	return int64(totalBytesTransmitted.Load())
 }
 
-func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, netHandle uint64) error {
+func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifiNetHandle, netHandle uint64) error {
 	relayMutex.Lock()
 	defer relayMutex.Unlock()
 
@@ -58,8 +58,8 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, netH
 		StopRelayLocked()
 	}
 
-	// Listen only on the Wi-Fi address, never on cellular
-	bind, err := NewSingleAddrBind(bindAddr)
+	// Listen only on the Wi-Fi address and network, never on cellular
+	bind, err := NewSingleAddrBind(bindAddr, wifiNetHandle)
 	if err != nil {
 		return err
 	}

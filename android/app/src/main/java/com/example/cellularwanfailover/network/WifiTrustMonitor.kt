@@ -37,6 +37,9 @@ class WifiTrustMonitor(
     private val _isNetworkTrusted = MutableStateFlow(false)
     val isNetworkTrusted: StateFlow<Boolean> = _isNetworkTrusted.asStateFlow()
 
+    // Keeps a verified connection trusted while Android hides the SSID (app in background)
+    private val stickyTrust = StickyWifiTrust { ssid -> trustedNetworkManager.isTrusted(ssid) }
+
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val isMonitoring = AtomicBoolean(false)
     private var scope: CoroutineScope? = null
@@ -68,20 +71,19 @@ class WifiTrustMonitor(
             override fun onAvailable(network: Network) {
                 Log.d(TAG, "Wi-Fi network available: $network")
                 val caps = connectivityManager.getNetworkCapabilities(network)
-                updateFromCapabilities(caps)
+                updateFromCapabilities(network, caps)
             }
 
             override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
                 Log.d(TAG, "Wi-Fi network capabilities changed: $network")
-                updateFromCapabilities(networkCapabilities)
+                updateFromCapabilities(network, networkCapabilities)
             }
 
             override fun onLost(network: Network) {
                 Log.d(TAG, "Wi-Fi network lost: $network")
+                stickyTrust.onNetworkLost(network.networkHandle)
                 // Check if any other Wi-Fi network is still connected
-                val currentInfo = NetworkUtils.getCurrentWifiInfo(context)
-                _currentWifiInfo.value = currentInfo
-                evaluateTrust()
+                refresh()
             }
         }
 
@@ -116,12 +118,16 @@ class WifiTrustMonitor(
     }
 
     fun refresh() {
-        val currentInfo = NetworkUtils.getCurrentWifiInfo(context)
-        _currentWifiInfo.value = currentInfo
-        evaluateTrust()
+        val network = NetworkUtils.getWifiNetwork(context)
+        if (network == null) {
+            _currentWifiInfo.value = null
+            evaluateTrust()
+            return
+        }
+        updateFromCapabilities(network, connectivityManager.getNetworkCapabilities(network))
     }
 
-    private fun updateFromCapabilities(caps: NetworkCapabilities?) {
+    private fun updateFromCapabilities(network: Network, caps: NetworkCapabilities?) {
         var ssid: String? = null
         var bssid: String? = null
 
@@ -136,10 +142,13 @@ class WifiTrustMonitor(
         if (ssid == null) {
             val fallback = NetworkUtils.getCurrentWifiInfo(context)
             if (fallback != null) {
-                ssid = fallback.ssid
+                ssid = NetworkUtils.normalizeSsid(fallback.ssid)
                 if (bssid == null) bssid = fallback.bssid
             }
         }
+
+        // Unreadable SSID (app in background): reuse the SSID verified for this same connection
+        ssid = stickyTrust.resolveSsid(network.networkHandle, ssid)
 
         val cleanBssid = if (bssid != null && bssid != "02:00:00:00:00:00") bssid else null
         val newInfo = if (ssid != null) {

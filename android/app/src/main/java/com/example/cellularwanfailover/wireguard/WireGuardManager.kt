@@ -59,7 +59,7 @@ class WireGuardManager(private val context: Context) {
     }
 
     @Synchronized
-    fun start(peerPublicKey: Key, bindAddress: String, netHandle: Long = 0L) {
+    fun start(peerPublicKey: Key, bindAddress: String, wifiNetHandle: Long, netHandle: Long = 0L) {
         if (_isRunning.get()) {
             log("WireGuard relay already active on port $LISTEN_PORT")
             return
@@ -72,6 +72,7 @@ class WireGuardManager(private val context: Context) {
                 privKeyBase64 = phoneKeyPair.privateKey.toBase64(),
                 peerPubKeyBase64 = peerPublicKey.toBase64(),
                 bindAddress = bindAddress,
+                wifiNetHandle = wifiNetHandle,
                 netHandle = netHandle
             )
             if (rc != 0) {

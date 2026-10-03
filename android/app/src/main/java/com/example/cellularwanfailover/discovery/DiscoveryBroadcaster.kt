@@ -1,5 +1,6 @@
 package com.example.cellularwanfailover.discovery
 
+import android.net.Network
 import android.os.Build
 import android.util.Log
 import com.example.cellularwanfailover.model.DiscoveryMessage
@@ -22,7 +23,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 class DiscoveryBroadcaster(
     private val httpPort: Int = 8989,
     private val broadcastPort: Int = 8990,
-    private val intervalMillis: Long = 5000L
+    private val intervalMillis: Long = 5000L,
+    /** Wi-Fi network to send on; without it broadcasts follow the default network (cellular during an outage) */
+    private val wifiNetworkProvider: () -> Network? = { null }
 ) {
     companion object {
         private const val TAG = "DiscoveryBroadcaster"
@@ -58,6 +61,7 @@ class DiscoveryBroadcaster(
                 try {
                     socket = DatagramSocket()
                     socket.broadcast = true
+                    wifiNetworkProvider()?.bindSocket(socket)
 
                     val targets = mutableSetOf<InetAddress>()
                     targets.add(InetAddress.getByName("255.255.255.255"))
@@ -88,7 +92,6 @@ class DiscoveryBroadcaster(
                             socket.send(packet)
                         } catch (_: Exception) {}
                     }
-                    Log.d(TAG, "Sent discovery broadcast to $targets: ${String(jsonPayload)}")
                 } catch (e: Exception) {
                     if (isActive) {
                         Log.w(TAG, "Discovery broadcast failed: ${e.message}")

@@ -1,10 +1,12 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"net/netip"
 	"sync"
+	"syscall"
 
 	"golang.zx2c4.com/wireguard/conn"
 )
@@ -12,15 +14,21 @@ import (
 // SingleAddrBind is a minimal conn.Bind that listens on one IPv4 address only
 // (the phone's Wi-Fi address), unlike conn.NewDefaultBind which listens on every
 // interface, including cellular where the phone may have a public IPv6 address.
+//
+// The socket is also bound to the Wi-Fi Android network (netHandle). Android routes
+// by network mark, not by source address: without it, replies to the gateway follow
+// the default network, which becomes cellular as soon as Wi-Fi loses internet access
+// (i.e. during the very outage the relay exists for).
 type SingleAddrBind struct {
-	mu   sync.Mutex
-	addr netip.Addr
-	udp  *net.UDPConn
+	mu        sync.Mutex
+	addr      netip.Addr
+	netHandle uint64
+	udp       *net.UDPConn
 }
 
 var _ conn.Bind = (*SingleAddrBind)(nil)
 
-func NewSingleAddrBind(bindAddr string) (*SingleAddrBind, error) {
+func NewSingleAddrBind(bindAddr string, netHandle uint64) (*SingleAddrBind, error) {
 	addr, err := netip.ParseAddr(bindAddr)
 	if err != nil {
 		return nil, fmt.Errorf("invalid bind address %q: %w", bindAddr, err)
@@ -29,7 +37,7 @@ func NewSingleAddrBind(bindAddr string) (*SingleAddrBind, error) {
 	if !addr.Is4() || addr.IsUnspecified() {
 		return nil, fmt.Errorf("bind address must be a specific IPv4 address, got %q", bindAddr)
 	}
-	return &SingleAddrBind{addr: addr}, nil
+	return &SingleAddrBind{addr: addr, netHandle: netHandle}, nil
 }
 
 func (b *SingleAddrBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
@@ -39,10 +47,16 @@ func (b *SingleAddrBind) Open(port uint16) ([]conn.ReceiveFunc, uint16, error) {
 	if b.udp != nil {
 		return nil, 0, conn.ErrBindAlreadyOpen
 	}
-	udp, err := net.ListenUDP("udp4", net.UDPAddrFromAddrPort(netip.AddrPortFrom(b.addr, port)))
+	lc := net.ListenConfig{
+		Control: func(network, address string, c syscall.RawConn) error {
+			return bindFdToNetwork(c, b.netHandle)
+		},
+	}
+	pc, err := lc.ListenPacket(context.Background(), "udp4", netip.AddrPortFrom(b.addr, port).String())
 	if err != nil {
 		return nil, 0, err
 	}
+	udp := pc.(*net.UDPConn)
 	b.udp = udp
 	actualPort := uint16(udp.LocalAddr().(*net.UDPAddr).Port)
 

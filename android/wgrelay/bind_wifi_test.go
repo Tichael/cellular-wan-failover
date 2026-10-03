@@ -10,14 +10,14 @@ import (
 
 func TestNewSingleAddrBindRejectsNonSpecificIPv4(t *testing.T) {
 	for _, addr := range []string{"", "0.0.0.0", "::", "fe80::1", "not-an-ip"} {
-		if _, err := NewSingleAddrBind(addr); err == nil {
+		if _, err := NewSingleAddrBind(addr, 0); err == nil {
 			t.Errorf("expected error for bind address %q", addr)
 		}
 	}
 }
 
 func TestSingleAddrBindListensOnlyOnGivenAddress(t *testing.T) {
-	b, err := NewSingleAddrBind("127.0.0.1")
+	b, err := NewSingleAddrBind("127.0.0.1", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
