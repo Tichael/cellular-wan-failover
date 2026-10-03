@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+#
+# Control and test utility for the Cellular WAN Failover Gateway.
+# Installed in the gateway image as /usr/local/bin/wanctl; run it from the host with:
+#   docker exec -it wan-failover-gateway wanctl <action> [PHONE_IP]
+#
+set -euo pipefail
+
+WATCHDOG="${WATCHDOG:-/app/watchdog.py}"
+PRIMARY_IFACE="${PRIMARY_IFACE:-eth0}"
+
+ACTION="${1:-help}"
+PHONE_IP="${2:-${PHONE_IP:-}}"
+
+run_gateway() {
+    python3 "$WATCHDOG" "$@"
+}
+
+EXTRA_ARGS=()
+if [ -n "$PHONE_IP" ]; then
+    EXTRA_ARGS+=(--phone-ip "$PHONE_IP")
+fi
+
+usage() {
+    echo "Usage: wanctl <action> [PHONE_IP]"
+    echo "From the host: docker exec -it wan-failover-gateway wanctl <action> [PHONE_IP]"
+    echo ""
+    echo "Available actions:"
+    echo "  discover           : Listen to network and display smartphone IP"
+    echo "  status [IP]        : Query Android service status (/v1/status)"
+    echo "  start [IP]         : Force immediate activation of WireGuard failover"
+    echo "  stop [IP]          : Stop failover and restore normal state"
+    echo "  test-probe         : Test ping probe via primary interface ($PRIMARY_IFACE)"
+    echo "  test-route         : Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)"
+}
+
+case "$ACTION" in
+    discover)
+        echo "=== Searching for smartphone via UDP broadcast ==="
+        run_gateway --discover-only
+        ;;
+
+    status)
+        echo "=== Querying smartphone service status ==="
+        run_gateway --status-only "${EXTRA_ARGS[@]}"
+        ;;
+
+    start)
+        echo "=== Activating cellular failover ==="
+        run_gateway --start-now "${EXTRA_ARGS[@]}"
+        ;;
+
+    stop)
+        echo "=== Stopping cellular failover ==="
+        run_gateway --stop-now "${EXTRA_ARGS[@]}"
+        ;;
+
+    test-probe)
+        echo "=== Testing primary WAN probe via $PRIMARY_IFACE ==="
+        ping -I "$PRIMARY_IFACE" -c 3 -W 2 1.1.1.1 || echo "Ping failed via $PRIMARY_IFACE"
+        ;;
+
+    test-route)
+        echo "=== Testing WAN egress path (Canary probe) ==="
+        run_gateway --test-route
+        ;;
+
+    help|-h|--help)
+        usage
+        ;;
+
+    *)
+        echo "Unknown action: $ACTION" >&2
+        echo "" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

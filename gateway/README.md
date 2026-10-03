@@ -183,28 +183,31 @@ docker run -d \
 
 ---
 
-## 5. CLI Utility (`wan_ctl.sh`)
+## 5. CLI Utility (`wanctl`)
 
-A helper script is provided for manual testing and operational control:
+The image includes the `wanctl` CLI for manual testing and operational control. Run it from the host with `docker exec` (no files needed on the host):
 
 ```bash
-chmod +x wan_ctl.sh
-
 # Discover smartphone on local Wi-Fi
-./wan_ctl.sh discover
+docker exec -it wan-failover-gateway wanctl discover
 
 # Check Android gateway status and byte counters
-./wan_ctl.sh status
+docker exec -it wan-failover-gateway wanctl status
 
 # Manually trigger WireGuard failover
-./wan_ctl.sh start
+docker exec -it wan-failover-gateway wanctl start
 
 # Test primary WAN 1 probe via eth0
-./wan_ctl.sh test-probe
+docker exec -it wan-failover-gateway wanctl test-probe
 
 # Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)
-./wan_ctl.sh test-route
+docker exec -it wan-failover-gateway wanctl test-route
 
 # Stop failover and return to standby
-./wan_ctl.sh stop
+docker exec -it wan-failover-gateway wanctl stop
+
+# Show all actions
+docker exec -it wan-failover-gateway wanctl help
 ```
+
+Optional shortcut on the host: `alias wanctl='docker exec -it wan-failover-gateway wanctl'`. For debugging, `docker exec -it wan-failover-gateway bash` opens a shell where `wanctl`, `wg`, `ip` and `iptables` are available.

@@ -58,7 +58,7 @@ mobile-wan-backup/
     ├── .env.example           # Centralized environment configuration template
     ├── entrypoint.sh          # Container entrypoint (auto-ip, internal dnsmasq, watchdog)
     ├── watchdog.py            # WAN 1 monitoring and automatic failover daemon
-    └── wan_ctl.sh             # CLI control and testing utility script
+    └── wanctl                 # CLI control utility (installed in the image as `wanctl`)
 ```
 
 ---
@@ -108,7 +108,7 @@ mobile-wan-backup/
    ```
 4. **Verify status** :
    ```bash
-   ./wan_ctl.sh status
+   docker exec -it wan-failover-gateway wanctl status
    ```
 
 #### Option B: Deploy with standalone `compose.yaml` (No Git clone needed)
@@ -150,32 +150,37 @@ Run: `docker compose up -d`
 
 ---
 
-## 5. Operations & CLI Utility (`wan_ctl.sh`)
+## 5. Operations & CLI Utility (`wanctl`)
 
-On the gateway host, use [`wan_ctl.sh`](gateway/wan_ctl.sh):
+The gateway image ships with the [`wanctl`](gateway/wanctl) CLI, so nothing needs to be installed on the host. Run it with `docker exec`:
 
 ```bash
 # Check smartphone status, relay state, and transmitted bytes
-./wan_ctl.sh status
+docker exec -it wan-failover-gateway wanctl status
 
 # Discover smartphone IP on local Wi-Fi via UDP beacons (port 8990)
-./wan_ctl.sh discover
+docker exec -it wan-failover-gateway wanctl discover
 
 # Manually trigger cellular failover activation
-./wan_ctl.sh start
+docker exec -it wan-failover-gateway wanctl start
 
 # Manually stop failover (return smartphone to low-power standby)
-./wan_ctl.sh stop
+docker exec -it wan-failover-gateway wanctl stop
 
 # Test WAN 1 primary probe connectivity (eth0)
-./wan_ctl.sh test-probe
+docker exec -it wan-failover-gateway wanctl test-probe
 
 # Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)
-./wan_ctl.sh test-route
+docker exec -it wan-failover-gateway wanctl test-route
 
 # Tail watchdog container logs in real time
 docker logs -f wan-failover-gateway
+
+# Open a shell in the container (wanctl, wg, ip and iptables are available)
+docker exec -it wan-failover-gateway bash
 ```
+
+Optional shortcut on the host: `alias wanctl='docker exec -it wan-failover-gateway wanctl'`
 
 ---
 
