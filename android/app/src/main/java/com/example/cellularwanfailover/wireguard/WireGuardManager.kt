@@ -2,6 +2,7 @@ package com.example.cellularwanfailover.wireguard
 
 import android.content.Context
 import android.util.Log
+import com.wireguard.crypto.Key
 import com.wireguard.crypto.KeyPair
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -12,7 +13,8 @@ class WireGuardManager(private val context: Context) {
         private const val TAG = "WireGuardManager"
         private const val PREFS_NAME = "wireguard_settings"
         private const val KEY_PHONE_PRIVATE = "phone_private_key"
-        private const val KEY_PI_PRIVATE = "pi_private_key"
+        // Gateway key used to be generated and served by the phone; it is now generated on the gateway
+        private const val LEGACY_KEY_PI_PRIVATE = "pi_private_key"
 
         const val LISTEN_PORT = 51820
         const val TUNNEL_PHONE_IP = "10.100.0.1"
@@ -22,11 +24,14 @@ class WireGuardManager(private val context: Context) {
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     val phoneKeyPair: KeyPair = loadOrCreateKeyPair(KEY_PHONE_PRIVATE)
-    val piKeyPair: KeyPair = loadOrCreateKeyPair(KEY_PI_PRIVATE)
 
     val phonePublicKey: String get() = phoneKeyPair.publicKey.toBase64()
-    val piPublicKey: String get() = piKeyPair.publicKey.toBase64()
-    val piPrivateKey: String get() = piKeyPair.privateKey.toBase64()
+
+    init {
+        if (prefs.contains(LEGACY_KEY_PI_PRIVATE)) {
+            prefs.edit().remove(LEGACY_KEY_PI_PRIVATE).apply()
+        }
+    }
 
     private val _isRunning = AtomicBoolean(false)
     val isRunning: Boolean get() = _isRunning.get()
@@ -53,34 +58,21 @@ class WireGuardManager(private val context: Context) {
         }
     }
 
-    fun generatePiWgQuickConfig(phoneWifiIp: String): String {
-        return """
-            [Interface]
-            Address = $TUNNEL_PI_IP/24
-            PrivateKey = $piPrivateKey
-            DNS = 1.1.1.1
-
-            [Peer]
-            PublicKey = $phonePublicKey
-            Endpoint = $phoneWifiIp:$LISTEN_PORT
-            AllowedIPs = 0.0.0.0/0
-            PersistentKeepalive = 25
-        """.trimIndent()
-    }
-
     @Synchronized
-    fun start(netHandle: Long = 0L) {
+    fun start(peerPublicKey: Key, bindAddress: String, wifiNetHandle: Long, netHandle: Long = 0L) {
         if (_isRunning.get()) {
             log("WireGuard relay already active on port $LISTEN_PORT")
             return
         }
 
         try {
-            log("Starting userspace WireGuard relay (Port $LISTEN_PORT, netId: $netHandle)...")
+            log("Starting userspace WireGuard relay ($bindAddress:$LISTEN_PORT, netId: $netHandle)...")
             val rc = WgRelay.startRelay(
                 port = LISTEN_PORT,
                 privKeyBase64 = phoneKeyPair.privateKey.toBase64(),
-                peerPubKeyBase64 = piKeyPair.publicKey.toBase64(),
+                peerPubKeyBase64 = peerPublicKey.toBase64(),
+                bindAddress = bindAddress,
+                wifiNetHandle = wifiNetHandle,
                 netHandle = netHandle
             )
             if (rc != 0) {

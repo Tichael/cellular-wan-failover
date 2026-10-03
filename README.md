@@ -58,7 +58,7 @@ mobile-wan-backup/
     ├── .env.example           # Centralized environment configuration template
     ├── entrypoint.sh          # Container entrypoint (auto-ip, internal dnsmasq, watchdog)
     ├── watchdog.py            # WAN 1 monitoring and automatic failover daemon
-    └── wan_ctl.sh             # CLI control and testing utility script
+    └── wanctl                 # CLI control utility (installed in the image as `wanctl`)
 ```
 
 ---
@@ -108,7 +108,7 @@ mobile-wan-backup/
    ```
 4. **Verify status** :
    ```bash
-   ./wan_ctl.sh status
+   docker exec -it wan-failover-gateway wanctl status
    ```
 
 #### Option B: Deploy with standalone `compose.yaml` (No Git clone needed)
@@ -150,32 +150,37 @@ Run: `docker compose up -d`
 
 ---
 
-## 5. Operations & CLI Utility (`wan_ctl.sh`)
+## 5. Operations & CLI Utility (`wanctl`)
 
-On the gateway host, use [`wan_ctl.sh`](gateway/wan_ctl.sh):
+The gateway image ships with the [`wanctl`](gateway/wanctl) CLI, so nothing needs to be installed on the host. Run it with `docker exec`:
 
 ```bash
 # Check smartphone status, relay state, and transmitted bytes
-./wan_ctl.sh status
+docker exec -it wan-failover-gateway wanctl status
 
 # Discover smartphone IP on local Wi-Fi via UDP beacons (port 8990)
-./wan_ctl.sh discover
+docker exec -it wan-failover-gateway wanctl discover
 
 # Manually trigger cellular failover activation
-./wan_ctl.sh start
+docker exec -it wan-failover-gateway wanctl start
 
 # Manually stop failover (return smartphone to low-power standby)
-./wan_ctl.sh stop
+docker exec -it wan-failover-gateway wanctl stop
 
 # Test WAN 1 primary probe connectivity (eth0)
-./wan_ctl.sh test-probe
+docker exec -it wan-failover-gateway wanctl test-probe
 
 # Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)
-./wan_ctl.sh test-route
+docker exec -it wan-failover-gateway wanctl test-route
 
 # Tail watchdog container logs in real time
 docker logs -f wan-failover-gateway
+
+# Open a shell in the container (wanctl, wg, ip and iptables are available)
+docker exec -it wan-failover-gateway bash
 ```
+
+Optional shortcut on the host: `alias wanctl='docker exec -it wan-failover-gateway wanctl'`
 
 ---
 
@@ -183,6 +188,6 @@ docker logs -f wan-failover-gateway
 
 1. **Continuous Monitoring** : The watchdog continuously monitors WAN 1 (`eth0`) using periodic ICMP pings to `1.1.1.1` and `8.8.8.8`.
 2. **Outage Detection** : Upon 3 consecutive ping failures, the watchdog invokes the phone's local HTTP API (`POST /v1/failover/start`).
-3. **Instant Failover** : The phone activates cellular data and starts its userspace WireGuard relay. The Pi brings up `wg0`, sets up Table 100 policy routing, and configures iptables MASQUERADE. The router detects WAN 2 healthy and routes all LAN traffic through it.
+3. **Instant Failover** : The Pi generates a fresh WireGuard key pair for this activation and sends only its public key in the start request. The phone activates cellular data and starts its userspace WireGuard relay, keyed to that public key. The phone's HTTP API (`8989`) and relay (`51820`) listen on its Wi-Fi address only, never on the cellular interface. The Pi builds its own `wg0` config from validated fields, brings up `wg0`, sets up Table 100 policy routing, and configures iptables MASQUERADE. The router detects WAN 2 healthy and routes all LAN traffic through it.
 4. **Tunnel Canary Verification & Automatic Recovery (Failback)** : While failover is active, the watchdog probes a non-routable benchmark IP (`198.18.0.1`, RFC 2544 / RFC 6890). If LAN default traffic is routed out WAN 2, the phone's WireGuard relay synthesizes replies and the canary succeeds, keeping failover active without flapping. Once primary WAN 1 recovers and the router switches its default route back to WAN 1, the canary times out (ISPs drop `198.18.0.1`). The watchdog then verifies direct internet connectivity via primary WAN 1 (`1.1.1.1`). After 5 consecutive direct successes, the Pi tears down `wg0`, flushes routing tables, and signals the phone to release cellular data (`POST /v1/failover/stop`).
 

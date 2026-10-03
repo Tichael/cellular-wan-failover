@@ -37,6 +37,11 @@ data class StatusResponse(
 )
 
 @Serializable
+data class StartFailoverRequest(
+    val gateway_public_key: String
+)
+
+@Serializable
 data class FailoverActionResponse(
     val result: String,
     val message: String? = null

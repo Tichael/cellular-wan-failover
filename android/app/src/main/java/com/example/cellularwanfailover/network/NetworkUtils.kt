@@ -2,6 +2,7 @@ package com.example.cellularwanfailover.network
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.Network
 import android.net.NetworkCapabilities
 import android.util.Log
 import java.net.Inet4Address
@@ -10,25 +11,51 @@ import java.net.NetworkInterface
 object NetworkUtils {
     private const val TAG = "NetworkUtils"
 
-    fun getWifiIpAddress(context: Context): String? {
+    /**
+     * A real Wi-Fi network, not a VPN. VPNs (including ones running in another
+     * profile, e.g. a work profile) report their underlying transport, so they
+     * also match TRANSPORT_WIFI.
+     */
+    private fun isPhysicalWifi(caps: NetworkCapabilities): Boolean =
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+            !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+
+    private fun ipv4Of(cm: ConnectivityManager, network: Network): String? {
+        val lp = cm.getLinkProperties(network) ?: return null
+        return lp.linkAddresses
+            .map { it.address }
+            .firstOrNull { it is Inet4Address && !it.isLoopbackAddress }
+            ?.hostAddress
+    }
+
+    /** The physical Wi-Fi network that has an IPv4 address (never a VPN). */
+    fun getWifiNetwork(context: Context): Network? {
         try {
-            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
-            if (cm != null) {
-                for (network in cm.allNetworks) {
-                    val caps = cm.getNetworkCapabilities(network) ?: continue
-                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
-                        val lp = cm.getLinkProperties(network) ?: continue
-                        for (linkAddr in lp.linkAddresses) {
-                            val addr = linkAddr.address
-                            if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                                return addr.hostAddress
-                            }
-                        }
-                    }
-                }
+            val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
+            return cm.allNetworks.firstOrNull { network ->
+                val caps = cm.getNetworkCapabilities(network)
+                caps != null && isPhysicalWifi(caps) && ipv4Of(cm, network) != null
             }
         } catch (e: Exception) {
-            Log.e(TAG, "Error getting Wi-Fi IP via ConnectivityManager", e)
+            Log.e(TAG, "Error looking up Wi-Fi network", e)
+            return null
+        }
+    }
+
+    /** IPv4 address of [network], or null. */
+    fun getIpv4Address(context: Context, network: Network): String? {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager ?: return null
+        return try {
+            ipv4Of(cm, network)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error reading IPv4 address of $network", e)
+            null
+        }
+    }
+
+    fun getWifiIpAddress(context: Context): String? {
+        getWifiNetwork(context)?.let { network ->
+            getIpv4Address(context, network)?.let { return it }
         }
 
         // Fallback: inspect network interfaces
@@ -43,19 +70,6 @@ object NetworkUtils {
                         if (addr is Inet4Address && !addr.isLoopbackAddress) {
                             return addr.hostAddress
                         }
-                    }
-                }
-            }
-
-            // General non-loopback fallback if name didn't match
-            val allInterfaces = NetworkInterface.getNetworkInterfaces() ?: return null
-            for (intf in allInterfaces) {
-                if (intf.isLoopback || !intf.isUp || intf.name.startsWith("rmnet") || intf.name.startsWith("dummy")) {
-                    continue
-                }
-                for (addr in intf.inetAddresses) {
-                    if (addr is Inet4Address && !addr.isLoopbackAddress) {
-                        return addr.hostAddress
                     }
                 }
             }
@@ -84,7 +98,7 @@ object NetworkUtils {
             if (cm != null) {
                 for (network in cm.allNetworks) {
                     val caps = cm.getNetworkCapabilities(network) ?: continue
-                    if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                    if (isPhysicalWifi(caps)) {
                         var ssid: String? = null
                         var bssid: String? = null
                         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {

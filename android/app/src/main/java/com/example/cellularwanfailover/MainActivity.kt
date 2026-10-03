@@ -55,9 +55,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -131,9 +129,7 @@ fun MainScreen(
     val trustedNetworks by controller.trustedNetworks.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
-    val clipboardManager = LocalClipboardManager.current
     val scope = rememberCoroutineScope()
-    var showWgDialog by remember { mutableStateOf(false) }
 
     // Request permissions for notifications and Wi-Fi SSID access (location)
     val permissionsLauncher = rememberLauncherForActivityResult(
@@ -203,16 +199,9 @@ fun MainScreen(
             ControlsCard(
                 failoverState = failoverState,
                 isNetworkTrusted = isNetworkTrusted,
-                onToggleFailover = {
-                    scope.launch {
-                        if (failoverState == FailoverState.ACTIVE) {
-                            controller.stopFailover()
-                        } else {
-                            controller.startFailover()
-                        }
-                    }
+                onStopFailover = {
+                    scope.launch { controller.stopFailover() }
                 },
-                onShowWireGuardConfig = { showWgDialog = true },
                 onRequestIgnoreBattery = onRequestIgnoreBattery
             )
 
@@ -223,52 +212,6 @@ fun MainScreen(
                 modifier = Modifier.weight(1f)
             )
         }
-    }
-
-    // WireGuard Raspberry Pi configuration modal dialog
-    if (showWgDialog) {
-        val piConfig = controller.getWireguardConfigString()
-        AlertDialog(
-            onDismissRequest = { showWgDialog = false },
-            title = { Text("Raspberry Pi WireGuard Configuration") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        text = "Configuration file /etc/wireguard/wg0.conf for your Raspberry Pi:",
-                        fontSize = 13.sp
-                    )
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(Color(0xFF1E1E1E))
-                            .padding(10.dp)
-                    ) {
-                        Text(
-                            text = piConfig,
-                            color = Color(0xFFD4D4D4),
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace
-                        )
-                    }
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        clipboardManager.setText(AnnotatedString(piConfig))
-                        showWgDialog = false
-                    }
-                ) {
-                    Text("Copy Config")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showWgDialog = false }) {
-                    Text("Close")
-                }
-            }
-        )
     }
 }
 
@@ -639,8 +582,7 @@ fun TrustedNetworksCard(
 fun ControlsCard(
     failoverState: FailoverState,
     isNetworkTrusted: Boolean,
-    onToggleFailover: () -> Unit,
-    onShowWireGuardConfig: () -> Unit,
+    onStopFailover: () -> Unit,
     onRequestIgnoreBattery: () -> Unit
 ) {
     Card(
@@ -655,36 +597,34 @@ fun ControlsCard(
                 fontSize = 15.sp
             )
 
-            Button(
-                onClick = onToggleFailover,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (failoverState == FailoverState.ACTIVE) Color(0xFFD32F2F) else MaterialTheme.colorScheme.primary
-                ),
-                enabled = isNetworkTrusted && failoverState != FailoverState.CONNECTING
-            ) {
-                if (!isNetworkTrusted) {
-                    Text("Start Failover (Paused: Untrusted Wi-Fi)")
-                } else if (failoverState == FailoverState.CONNECTING) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(18.dp),
-                        color = Color.White,
-                        strokeWidth = 2.dp
-                    )
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text("Activating...")
-                } else if (failoverState == FailoverState.ACTIVE) {
-                    Text("Stop Failover Relay")
-                } else {
-                    Text("Start Failover Relay")
+            when {
+                failoverState == FailoverState.ACTIVE -> {
+                    Button(
+                        onClick = onStopFailover,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                    ) {
+                        Text("Stop Failover Relay")
+                    }
                 }
-            }
-
-            OutlinedButton(
-                onClick = onShowWireGuardConfig,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Show Raspberry Pi WireGuard Config", fontSize = 13.sp)
+                failoverState == FailoverState.CONNECTING -> {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Activating cellular relay...", fontSize = 13.sp)
+                    }
+                }
+                else -> {
+                    Text(
+                        text = if (isNetworkTrusted) {
+                            "Failover is started by the gateway when it detects a WAN outage."
+                        } else {
+                            "Paused: connect to a trusted Wi-Fi network."
+                        },
+                        color = Color.Gray,
+                        fontSize = 12.sp
+                    )
+                }
             }
 
             OutlinedButton(

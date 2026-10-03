@@ -32,6 +32,7 @@ ENV PRIMARY_IFACE=eth0 \
     CANARY_IP=198.18.0.1 \
     FAIL_THRESHOLD=3 \
     RESTORE_THRESHOLD=5 \
+    TUNNEL_FAIL_THRESHOLD=3 \
     CHECK_INTERVAL=5
 
 WORKDIR /app
@@ -39,7 +40,8 @@ WORKDIR /app
 # Copy scripts
 COPY watchdog.py /app/watchdog.py
 COPY entrypoint.sh /app/entrypoint.sh
+COPY wanctl /usr/local/bin/wanctl
 
-RUN chmod +x /app/entrypoint.sh /app/watchdog.py
+RUN chmod +x /app/entrypoint.sh /app/watchdog.py /usr/local/bin/wanctl
 
 ENTRYPOINT ["/app/entrypoint.sh"]

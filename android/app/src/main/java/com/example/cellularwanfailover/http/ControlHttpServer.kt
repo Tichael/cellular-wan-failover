@@ -3,6 +3,7 @@ package com.example.cellularwanfailover.http
 import android.util.Log
 import com.example.cellularwanfailover.model.CellularState
 import com.example.cellularwanfailover.model.FailoverActionResponse
+import com.example.cellularwanfailover.model.StartFailoverRequest
 import com.example.cellularwanfailover.model.StatusResponse
 import io.ktor.http.HttpStatusCode
 import io.ktor.serialization.kotlinx.json.json
@@ -13,6 +14,7 @@ import io.ktor.server.cio.CIOApplicationEngine
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.server.request.receive
 import io.ktor.server.response.respond
 import io.ktor.server.routing.get
 import io.ktor.server.routing.post
@@ -22,8 +24,7 @@ import kotlinx.serialization.json.Json
 import java.util.concurrent.atomic.AtomicBoolean
 
 import com.example.cellularwanfailover.model.WireGuardInfo
-import io.ktor.http.ContentType
-import io.ktor.server.response.respondText
+import com.wireguard.crypto.Key
 
 interface FailoverControlDelegate {
     val failoverStatusString: String
@@ -34,8 +35,7 @@ interface FailoverControlDelegate {
     val wireguardPublicKey: String
     val wireguardTunnelIp: String
     val wireguardPeerIp: String
-    fun getWireguardConfigString(): String
-    suspend fun startFailover(): Boolean
+    suspend fun startFailover(gatewayPublicKey: Key): Boolean
     suspend fun stopFailover()
     fun logEvent(tag: String, message: String, isError: Boolean = false)
 }
@@ -52,15 +52,20 @@ class ControlHttpServer(
     private val _isRunning = AtomicBoolean(false)
     val isRunning: Boolean get() = _isRunning.get()
 
+    @Volatile
+    var bindAddress: String? = null
+        private set
+
+    /** Listens on [bindAddress] only (the phone's Wi-Fi IP), never on all interfaces. */
     @Synchronized
-    fun start() {
+    fun start(bindAddress: String) {
         if (_isRunning.getAndSet(true)) {
-            Log.d(TAG, "HTTP server already running on port $port")
+            Log.d(TAG, "HTTP server already running on ${this.bindAddress}:$port")
             return
         }
 
         try {
-            val serverEngine = embeddedServer(CIO, port = port, host = "0.0.0.0") {
+            val serverEngine = embeddedServer(CIO, port = port, host = bindAddress) {
                 install(ContentNegotiation) {
                     json(Json {
                         prettyPrint = true
@@ -90,17 +95,21 @@ class ControlHttpServer(
                         call.respond(HttpStatusCode.OK, response)
                     }
 
-                    get("/v1/wireguard/config") {
-                        val clientIp = call.request.local.remoteHost
-                        delegate.logEvent("KtorServer", "GET /v1/wireguard/config from $clientIp")
-                        call.respondText(delegate.getWireguardConfigString(), ContentType.Text.Plain)
-                    }
-
                     post("/v1/failover/start") {
                         val clientIp = call.request.local.remoteHost
                         delegate.logEvent("KtorServer", "POST /v1/failover/start from $clientIp")
+                        val gatewayKey = try {
+                            Key.fromBase64(call.receive<StartFailoverRequest>().gateway_public_key)
+                        } catch (e: Exception) {
+                            delegate.logEvent("KtorServer", "Rejected failover start: missing or invalid gateway_public_key", true)
+                            call.respond(
+                                HttpStatusCode.BadRequest,
+                                FailoverActionResponse(result = "error", message = "Body must be JSON with a valid base64 gateway_public_key")
+                            )
+                            return@post
+                        }
                         try {
-                            val success = delegate.startFailover()
+                            val success = delegate.startFailover(gatewayKey)
                             if (success) {
                                 call.respond(HttpStatusCode.OK, FailoverActionResponse(result = "active"))
                             } else {
@@ -137,7 +146,8 @@ class ControlHttpServer(
 
             server = serverEngine
             serverEngine.start(wait = false)
-            delegate.logEvent("KtorServer", "Control HTTP server started on 0.0.0.0:$port")
+            this.bindAddress = bindAddress
+            delegate.logEvent("KtorServer", "Control HTTP server started on $bindAddress:$port")
         } catch (e: Exception) {
             _isRunning.set(false)
             delegate.logEvent("KtorServer", "Failed to start HTTP server: ${e.message}", true)
@@ -152,6 +162,7 @@ class ControlHttpServer(
         try {
             server?.stop(gracePeriodMillis = 500, timeoutMillis = 1000)
             server = null
+            bindAddress = null
             delegate.logEvent("KtorServer", "Control HTTP server stopped")
         } catch (e: Exception) {
             Log.w(TAG, "Error stopping HTTP server: ${e.message}")

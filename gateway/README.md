@@ -54,6 +54,8 @@ sudo modprobe iptable_nat
 
 The gateway runs as a self-contained, lightweight Alpine Docker container.
 
+> **Upgrading:** the gateway and the Android app must be updated together. Newer gateways generate their own WireGuard key and no longer use `GET /v1/wireguard/config`. Older phones still serve it but ignore the gateway key, and newer phones reject start requests that don't include one.
+
 ### Configuration (`.env`)
 Copy the provided `.env.example` to `.env` and customize parameters if needed:
 ```bash
@@ -151,10 +153,13 @@ docker run -d \
    - Continuously pings `1.1.1.1` and `8.8.8.8` via `eth0` (`ping -I eth0`).
 3. **Smartphone Auto-Discovery** :
    - Listens for UDP broadcast beacons sent every 5 seconds by the Android app on port `8990`.
+   - Tracks **every** phone running the app (e.g. both adults' phones in a family). A phone is available while its beacons keep arriving (last 15 seconds); only one carries the failover at a time.
    - Handles dynamic smartphone Wi-Fi IP changes automatically with no static DHCP reservation needed.
 4. **Failover Trigger (after 3 consecutive failures)** :
-   - Calls `POST http://<phone_ip>:8989/v1/failover/start` to activate cellular data and the WireGuard relay on the phone.
-   - Retrieves configuration via `GET http://<phone_ip>:8989/v1/wireguard/config`.
+   - Generates a fresh WireGuard key pair locally (`wg genkey`). The private key never leaves the gateway.
+   - Reads the phone's WireGuard public key and port from `GET http://<phone_ip>:8989/v1/status`.
+   - Calls `POST http://<phone_ip>:8989/v1/failover/start` with `{"gateway_public_key": "<base64>"}` to activate cellular data and the WireGuard relay on the phone.
+   - Builds `/etc/wireguard/wg0.conf` itself from validated fields only (keys, IPv4 addresses, port; mode `0600`). Nothing received from the phone is written verbatim, so the phone cannot inject `PostUp`-style commands.
    - Brings up WireGuard interface `wg0`.
    - Applies an isolated policy routing table (**Table 100**) so only UniFi WAN 2 traffic is redirected:
      ```bash
@@ -168,7 +173,11 @@ docker run -d \
      iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
      ```
    - Router detects WAN 2 online and routes local network traffic through it.
-5. **Tunnel Canary Verification & Failback Recovery** :
+   - If the first available phone fails to activate, the next one is tried.
+5. **Lost Phone Handover** :
+   - While failover is active, the watchdog also pings the canary IP through `wg0` itself. Only the phone's relay answers it, so this checks the tunnel, the relay and the phone's cellular link end to end.
+   - After 3 consecutive failed probes (`TUNNEL_FAIL_THRESHOLD`), the phone is considered lost (app crashed, empty battery, out of Wi-Fi range...). If WAN 1 is reachable again, failover simply ends; otherwise it is handed over to another available phone, or restarted on the same one if it is the only phone left (a fresh key is generated either way).
+6. **Tunnel Canary Verification & Failback Recovery** :
    - While failover is active, the watchdog probes a non-routable benchmark IP (`198.18.0.1`, RFC 2544 / RFC 6890) via `eth0`.
    - **Why this is completely router-agnostic and avoids fragile iptables manipulation**:
      - `198.18.0.1` is reserved for benchmarking and is not routable on the public internet (ISPs drop it).
@@ -179,28 +188,31 @@ docker run -d \
 
 ---
 
-## 5. CLI Utility (`wan_ctl.sh`)
+## 5. CLI Utility (`wanctl`)
 
-A helper script is provided for manual testing and operational control:
+The image includes the `wanctl` CLI for manual testing and operational control. Run it from the host with `docker exec` (no files needed on the host):
 
 ```bash
-chmod +x wan_ctl.sh
-
 # Discover smartphone on local Wi-Fi
-./wan_ctl.sh discover
+docker exec -it wan-failover-gateway wanctl discover
 
 # Check Android gateway status and byte counters
-./wan_ctl.sh status
+docker exec -it wan-failover-gateway wanctl status
 
 # Manually trigger WireGuard failover
-./wan_ctl.sh start
+docker exec -it wan-failover-gateway wanctl start
 
 # Test primary WAN 1 probe via eth0
-./wan_ctl.sh test-probe
+docker exec -it wan-failover-gateway wanctl test-probe
 
 # Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)
-./wan_ctl.sh test-route
+docker exec -it wan-failover-gateway wanctl test-route
 
 # Stop failover and return to standby
-./wan_ctl.sh stop
+docker exec -it wan-failover-gateway wanctl stop
+
+# Show all actions
+docker exec -it wan-failover-gateway wanctl help
 ```
+
+Optional shortcut on the host: `alias wanctl='docker exec -it wan-failover-gateway wanctl'`. For debugging, `docker exec -it wan-failover-gateway bash` opens a shell where `wanctl`, `wg`, `ip` and `iptables` are available.
