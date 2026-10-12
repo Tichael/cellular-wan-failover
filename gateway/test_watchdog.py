@@ -1,16 +1,22 @@
+import http.server
 import json
 import os
 import subprocess
+import threading
 import urllib.error
 from unittest.mock import MagicMock, patch
 
+import pairing
 import pytest
 from watchdog import (
     AndroidFailoverClient,
     FailoverCoordinator,
+    PhoneAuthError,
     PhoneDiscovery,
+    PhoneRequestError,
     RoutingManager,
     activate_failover,
+    manual_stop,
     build_wg_config,
     check_primary_wan,
     check_tunnel_canary,
@@ -26,117 +32,246 @@ KEY_B = "nGrA9Rfrm/XXy1OI0Nn2D9VoFFdbg+QnqWJyolQaDHw="
 KEY_C = "8BWqdg4V2GV7RVyiUb6Q4GPqHHQlOfzCoA1bBoGwn2g="
 
 
+GW_ID = "Z2F0ZXdheS1pZC0wMDAwMQ"
+PHONE_KEY = bytes(range(32))
+
+
+class FakePhone:
+    """Minimal phone-side API: issues challenges, checks request signatures, signs answers."""
+
+    def __init__(self, phone_id="cGhvbmUtaWQtMDAwMDAwMQ", key=PHONE_KEY, sign_key=None):
+        self.gateway_id = GW_ID
+        self.phone_id = phone_id
+        self.key = key
+        # Key used to sign answers (a different one simulates an impostor)
+        self.sign_key = sign_key or key
+        self.challenges = set()
+        self.requests = []
+        self.routes = {}
+        fake = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _answer(self, status, payload, nonce=None, signed=True):
+                body = json.dumps(payload).encode()
+                self.send_response(status)
+                if signed and nonce is not None:
+                    fields = pairing.response_fields(fake.gateway_id, fake.phone_id, nonce, status, body)
+                    self.send_header(pairing.HEADER_SIGNATURE, pairing.sign(fake.sign_key, fields))
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def _handle(self, method):
+                if self.path == "/v1/challenge":
+                    challenge = pairing.new_id()
+                    fake.challenges.add(challenge)
+                    return self._answer(200, {"challenge": challenge}, signed=False)
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                challenge = self.headers.get(pairing.HEADER_CHALLENGE)
+                nonce = self.headers.get(pairing.HEADER_NONCE)
+                fields = pairing.request_fields(
+                    self.headers.get(pairing.HEADER_GATEWAY), self.headers.get(pairing.HEADER_PHONE), method, self.path, challenge, nonce, body
+                )
+                valid = challenge in fake.challenges and pairing.verify(fake.key, self.headers.get(pairing.HEADER_SIGNATURE), fields)
+                fake.challenges.discard(challenge)
+                if not valid:
+                    return self._answer(401, {"result": "error"}, signed=False)
+                fake.requests.append((method, self.path, body))
+                route = fake.routes.get(self.path, (200, {"result": "ok"}))
+                status, payload = route() if callable(route) else route
+                self._answer(status, payload, nonce)
+
+            def do_GET(self):
+                self._handle("GET")
+
+            def do_POST(self):
+                self._handle("POST")
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+
+    def client(self, key=None):
+        return AndroidFailoverClient(
+            phone_ip="127.0.0.1", phone_id=self.phone_id, key=key or self.key, gateway_id=self.gateway_id, http_port=self.port, timeout=2.0
+        )
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def phone():
+    fake = FakePhone()
+    yield fake
+    fake.close()
+
+
 class TestAndroidFailoverClient:
     def test_base_url(self):
-        client = AndroidFailoverClient(phone_ip="192.168.1.50", http_port=8989)
+        client = AndroidFailoverClient(phone_ip="192.168.1.50", phone_id="p", key=PHONE_KEY, gateway_id=GW_ID, http_port=8989)
         assert client.base_url == "http://192.168.1.50:8989"
 
-    @patch("urllib.request.urlopen")
-    def test_get_status_success(self, mock_urlopen):
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"status": "STANDBY", "cellularConnected": true}'
-        mock_response.__enter__.return_value = mock_response
-        mock_urlopen.return_value = mock_response
+    def test_signed_status_round_trip(self, phone):
+        phone.routes["/v1/status"] = (200, {"status": "idle", "cellular_ready": True})
+        status = phone.client().get_status()
+        assert status == {"status": "idle", "cellular_ready": True}
+        assert phone.requests == [("GET", "/v1/status", b"")]
 
-        client = AndroidFailoverClient(phone_ip="10.20.0.5")
-        status = client.get_status()
+    def test_start_failover_sends_signed_key(self, phone):
+        phone.routes["/v1/failover/start"] = (200, {"result": "active"})
+        assert phone.client().start_failover(KEY_A) == {"result": "active"}
+        method, path, body = phone.requests[0]
+        assert (method, path) == ("POST", "/v1/failover/start")
+        assert json.loads(body) == {"gateway_public_key": KEY_A}
 
-        assert status["status"] == "STANDBY"
-        assert status["cellularConnected"] is True
-        assert mock_urlopen.call_count == 1
+    def test_stop_failover(self, phone):
+        phone.routes["/v1/failover/stop"] = (200, {"result": "idle"})
+        assert phone.client().stop_failover() == {"result": "idle"}
 
-    @patch("urllib.request.urlopen")
-    def test_start_failover_success(self, mock_urlopen):
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"status": "ACTIVE", "active": true}'
-        mock_response.__enter__.return_value = mock_response
-        mock_urlopen.return_value = mock_response
+    def test_each_request_uses_a_new_challenge(self, phone):
+        client = phone.client()
+        client.get_status()
+        client.get_status()
+        assert len(phone.requests) == 2
+        assert phone.challenges == set()
 
-        client = AndroidFailoverClient(phone_ip="10.20.0.5")
-        result = client.start_failover(KEY_A)
+    def test_rejected_signature_raises_auth_error(self, phone):
+        with pytest.raises(PhoneAuthError, match="rejected our signature"):
+            phone.client(key=bytes(32)).get_status()
+        assert phone.requests == []
 
-        assert result["status"] == "ACTIVE"
-        assert result["active"] is True
+    def test_answer_signed_by_impostor_is_rejected(self):
+        # e.g. another LAN device answering in place of the phone with its own WireGuard key
+        impostor = FakePhone(sign_key=bytes(32))
+        impostor.routes["/v1/status"] = (200, {"wireguard": {"public_key": KEY_C}})
+        try:
+            with pytest.raises(PhoneAuthError, match="not signed by the paired phone"):
+                impostor.client().get_status()
+        finally:
+            impostor.close()
 
-        req = mock_urlopen.call_args[0][0]
-        assert req.get_method() == "POST"
-        assert req.get_header("Content-type") == "application/json"
-        assert json.loads(req.data) == {"gateway_public_key": KEY_A}
-
-    @patch("urllib.request.urlopen")
-    def test_stop_failover_success(self, mock_urlopen):
-        mock_response = MagicMock()
-        mock_response.read.return_value = b'{"status": "STANDBY", "active": false}'
-        mock_response.__enter__.return_value = mock_response
-        mock_urlopen.return_value = mock_response
-
-        client = AndroidFailoverClient(phone_ip="10.20.0.5")
-        result = client.stop_failover()
-
-        assert result["status"] == "STANDBY"
-        assert result["active"] is False
+    def test_signed_refusal_raises_request_error(self, phone):
+        phone.routes["/v1/failover/start"] = (409, {"result": "busy", "message": "Serving another gateway"})
+        with pytest.raises(PhoneRequestError, match="Serving another gateway") as err:
+            phone.client().start_failover(KEY_A)
+        assert err.value.status == 409
 
     @patch("time.sleep")
-    @patch("urllib.request.urlopen")
-    def test_retry_on_failure_and_recover(self, mock_urlopen, mock_sleep):
-        mock_success = MagicMock()
-        mock_success.read.return_value = b'{"status": "ACTIVE"}'
-        mock_success.__enter__.return_value = mock_success
+    def test_retry_on_failure_and_recover(self, mock_sleep, phone):
+        real_send = AndroidFailoverClient._send_once
+        calls = []
 
-        mock_urlopen.side_effect = [
-            urllib.error.URLError("Connection refused"),
-            mock_success,
-        ]
+        def flaky(self, *args):
+            calls.append(1)
+            if len(calls) == 1:
+                raise urllib.error.URLError("Connection refused")
+            return real_send(self, *args)
 
-        client = AndroidFailoverClient(phone_ip="10.20.0.5")
-        status = client.get_status()
-
-        assert status["status"] == "ACTIVE"
-        assert mock_urlopen.call_count == 2
+        with patch.object(AndroidFailoverClient, "_send_once", flaky):
+            assert phone.client().get_status() == {"result": "ok"}
+        assert len(calls) == 2
         assert mock_sleep.call_count == 1
 
     @patch("time.sleep")
     @patch("urllib.request.urlopen")
     def test_max_retries_exceeded_raises(self, mock_urlopen, mock_sleep):
         mock_urlopen.side_effect = urllib.error.URLError("Host unreachable")
-
-        client = AndroidFailoverClient(phone_ip="10.20.0.5")
+        client = AndroidFailoverClient(phone_ip="10.20.0.5", phone_id="p", key=PHONE_KEY, gateway_id=GW_ID)
         with pytest.raises(urllib.error.URLError, match="Host unreachable"):
             client.get_status()
+        assert mock_urlopen.call_count == 3
+
+
+def discovery_packet(entries) -> bytes:
+    return json.dumps({"service": "wan-failover", "v": 1, "pairings": entries}).encode()
+
+
+def signed_entry(phone_id, ip, key=PHONE_KEY, gateway_id=GW_ID):
+    return {"gw": gateway_id, "pid": phone_id, "sig": pairing.sign(key, pairing.discovery_fields(gateway_id, phone_id, ip))}
 
 
 class TestPhoneDiscovery:
-    def test_initial_ip(self):
-        discovery = PhoneDiscovery(port=8990, initial_ip="10.20.0.99")
-        assert discovery.get_phone_ip() == "10.20.0.99"
-        assert discovery.phone_ip == "10.20.0.99"
+    def make(self, keys=None):
+        keys = keys if keys is not None else {"phoneA": PHONE_KEY, "phoneB": PHONE_KEY}
+        return PhoneDiscovery(gateway_id=GW_ID, key_for=keys.get, port=18990, max_age=15.0)
 
     def test_start_and_stop(self):
-        discovery = PhoneDiscovery(port=18990)
+        discovery = self.make()
         discovery.start()
         assert discovery._running is True
         discovery.stop()
         assert discovery._running is False
 
+    def test_accepts_signed_broadcast(self):
+        discovery = self.make()
+        assert discovery.handle_packet("10.20.0.10", discovery_packet([signed_entry("phoneA", "10.20.0.10")]), now=100.0) == ["phoneA"]
+        assert discovery.get_available_phones(now=101.0) == [("phoneA", "10.20.0.10")]
+
+    def test_picks_own_entry_among_other_gateways(self):
+        discovery = self.make()
+        packet = discovery_packet([
+            signed_entry("phoneX", "10.20.0.10", gateway_id="b3RoZXItZ2F0ZXdheQ"),
+            signed_entry("phoneA", "10.20.0.10"),
+        ])
+        assert discovery.handle_packet("10.20.0.10", packet, now=100.0) == ["phoneA"]
+
+    @pytest.mark.parametrize("packet", [
+        b"not json",
+        b"[]",
+        json.dumps({"service": "other", "pairings": []}).encode(),
+        json.dumps({"service": "wan-failover", "pairings": "x"}).encode(),
+        json.dumps({"service": "wan-failover", "device": "Pixel"}).encode(),
+    ])
+    def test_ignores_malformed_packets(self, packet):
+        discovery = self.make()
+        assert discovery.handle_packet("10.20.0.10", packet, now=100.0) == []
+        assert discovery.get_available_phones(now=100.0) == []
+
+    def test_ignores_unknown_phone(self):
+        discovery = self.make(keys={})
+        assert discovery.handle_packet("10.20.0.10", discovery_packet([signed_entry("phoneA", "10.20.0.10")])) == []
+
+    def test_ignores_bad_signature(self):
+        discovery = self.make()
+        entry = signed_entry("phoneA", "10.20.0.10", key=bytes(32))
+        assert discovery.handle_packet("10.20.0.10", discovery_packet([entry])) == []
+
+    def test_ignores_broadcast_replayed_from_another_address(self):
+        discovery = self.make()
+        packet = discovery_packet([signed_entry("phoneA", "10.20.0.10")])
+        assert discovery.handle_packet("10.20.0.66", packet) == []
+
     def test_tracks_multiple_phones_most_recent_first(self):
-        discovery = PhoneDiscovery(port=18990, max_age=15.0)
-        discovery.record_phone("10.20.0.10", {"device": "Pixel A"}, now=100.0)
-        discovery.record_phone("10.20.0.11", {"device": "Pixel B"}, now=103.0)
-        assert discovery.get_available_phones(now=104.0) == ["10.20.0.11", "10.20.0.10"]
-        assert discovery.get_phone_ip() == "10.20.0.11"
+        discovery = self.make()
+        discovery.record_phone("phoneA", "10.20.0.10", now=100.0)
+        discovery.record_phone("phoneB", "10.20.0.11", now=103.0)
+        assert discovery.get_available_phones(now=104.0) == [("phoneB", "10.20.0.11"), ("phoneA", "10.20.0.10")]
 
     def test_silent_phone_becomes_unavailable(self):
-        discovery = PhoneDiscovery(port=18990, max_age=15.0)
-        discovery.record_phone("10.20.0.10", {"device": "Pixel A"}, now=100.0)
-        discovery.record_phone("10.20.0.11", {"device": "Pixel B"}, now=110.0)
+        discovery = self.make()
+        discovery.record_phone("phoneA", "10.20.0.10", now=100.0)
+        discovery.record_phone("phoneB", "10.20.0.11", now=110.0)
         # Phone A stopped broadcasting (battery, crash, out of range)
-        assert discovery.get_available_phones(now=120.0) == ["10.20.0.11"]
+        assert discovery.get_available_phones(now=120.0) == [("phoneB", "10.20.0.11")]
 
-    def test_static_phone_always_available(self):
-        discovery = PhoneDiscovery(port=18990, initial_ip="10.20.0.99", max_age=15.0)
-        assert discovery.get_available_phones(now=1000.0) == ["10.20.0.99"]
-        discovery.record_phone("10.20.0.10", {"device": "Pixel A"}, now=1000.0)
-        assert discovery.get_available_phones(now=1001.0) == ["10.20.0.10", "10.20.0.99"]
+    def test_phone_ip_change_is_followed(self):
+        discovery = self.make()
+        discovery.record_phone("phoneA", "10.20.0.10", now=100.0)
+        discovery.record_phone("phoneA", "10.20.0.42", now=105.0)
+        assert discovery.get_available_phones(now=106.0) == [("phoneA", "10.20.0.42")]
+
+    def test_wait_for_specific_phone(self):
+        discovery = self.make()
+        discovery.record_phone("phoneA", "10.20.0.10")
+        discovery.record_phone("phoneB", "10.20.0.11")
+        assert discovery.wait_for_phone(timeout=1.0, phone_id="phoneA") == ("phoneA", "10.20.0.10")
+        with pytest.raises(TimeoutError):
+            discovery.wait_for_phone(timeout=0.1, phone_id="phoneC")
 
 
 class TestNetworkProbes:
@@ -324,46 +459,110 @@ class TestWireGuardConfig:
 
 class FakeDiscovery:
     def __init__(self, phones):
+        self.gateway_id = GW_ID
         self.phones = list(phones)
 
     def get_available_phones(self):
         return list(self.phones)
 
 
+def fake_store(tmp_path, phone_ids):
+    store = pairing.PairingStore(str(tmp_path))
+    for pid in phone_ids:
+        store.add(pairing.PairedPhone(id=pid, name=f"Pixel {pid}", key=PHONE_KEY, ssid="Home", paired_at=0))
+    return store
+
+
 class TestFailoverCoordinator:
-    def make(self, phones, failing_phones=()):
+    @pytest.fixture(autouse=True)
+    def _tmp(self, tmp_path):
+        self.tmp_path = tmp_path
+
+    def make(self, phones, failing_phones=(), refusing_phones=()):
         clients = {}
 
-        def factory(phone_ip, http_port):
-            client = clients.setdefault(phone_ip, MagicMock(name=phone_ip))
+        def factory(phone_ip, phone_id, key, gateway_id, http_port):
+            client = clients.setdefault(phone_id, MagicMock(name=phone_id))
             client.phone_ip = phone_ip
+            client.phone_id = phone_id
             return client
 
         def fake_activate(client, routing):
-            if client.phone_ip in failing_phones:
-                raise ConnectionError(f"{client.phone_ip} unreachable")
+            if client.phone_id in failing_phones:
+                raise ConnectionError(f"{client.phone_id} unreachable")
+            if client.phone_id in refusing_phones:
+                raise PhoneRequestError(409, "Serving another gateway")
             return {"result": "active"}
 
         routing = MagicMock()
         coordinator = FailoverCoordinator(
-            discovery=FakeDiscovery(phones), routing=routing, tunnel_fail_threshold=3, client_factory=factory
+            discovery=FakeDiscovery(phones),
+            routing=routing,
+            store=fake_store(self.tmp_path, [pid for pid, _ in phones]),
+            tunnel_fail_threshold=3,
+            client_factory=factory,
         )
         return coordinator, routing, clients, fake_activate
 
+    A = ("phoneA", "10.20.0.10")
+    B = ("phoneB", "10.20.0.11")
+
     def test_activate_uses_first_available_phone(self):
-        coordinator, _, _, fake_activate = self.make(["10.20.0.10", "10.20.0.11"])
+        coordinator, _, clients, fake_activate = self.make([self.A, self.B])
         with patch("watchdog.activate_failover", side_effect=fake_activate):
             assert coordinator.activate() is True
-        assert coordinator.active_phone_ip == "10.20.0.10"
+        assert coordinator.active_phone == self.A
+        assert coordinator.active_phone_label == "Pixel phoneA (10.20.0.10)"
+
+    def test_activate_prefers_requested_phone(self):
+        coordinator, _, _, fake_activate = self.make([self.A, self.B])
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            assert coordinator.activate(prefer="phoneB") is True
+        assert coordinator.active_phone == self.B
 
     def test_activate_falls_back_to_next_phone(self):
-        coordinator, routing, clients, fake_activate = self.make(["10.20.0.10", "10.20.0.11"], failing_phones={"10.20.0.10"})
+        coordinator, routing, clients, fake_activate = self.make([self.A, self.B], failing_phones={"phoneA"})
         with patch("watchdog.activate_failover", side_effect=fake_activate):
             assert coordinator.activate() is True
-        assert coordinator.active_phone_ip == "10.20.0.11"
+        assert coordinator.active_phone == self.B
         # Partial state from the failed attempt was cleaned up
         routing.teardown_wireguard_interface.assert_called()
-        clients["10.20.0.10"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
+        clients["phoneA"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
+
+    def test_busy_phone_is_skipped_without_stopping_it(self):
+        # Phone A serves another gateway: asking it to stop would be refused anyway
+        coordinator, _, clients, fake_activate = self.make([self.A, self.B], refusing_phones={"phoneA"})
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            assert coordinator.activate() is True
+        assert coordinator.active_phone == self.B
+        clients["phoneA"].stop_failover.assert_not_called()
+
+    def test_unpaired_phone_is_skipped(self):
+        coordinator, _, _, fake_activate = self.make([self.A, self.B])
+        coordinator.store.remove("phoneA")
+        with patch("watchdog.activate_failover", side_effect=fake_activate):
+            assert coordinator.activate() is True
+        assert coordinator.active_phone == self.B
+
+    def test_client_uses_paired_key(self):
+        coordinator = FailoverCoordinator(
+            discovery=FakeDiscovery([self.A]), routing=MagicMock(), store=fake_store(self.tmp_path, ["phoneA"])
+        )
+        client = coordinator.client(*self.A)
+        assert (client.phone_ip, client.phone_id, client.key, client.gateway_id) == ("10.20.0.10", "phoneA", PHONE_KEY, GW_ID)
+
+    def test_manual_stop_without_phones_still_tears_down_locally(self):
+        coordinator, routing, _, _ = self.make([])
+        manual_stop(routing, coordinator.discovery, coordinator, listen=0)
+        routing.disable_routing_and_nat.assert_called_once()
+        routing.teardown_wireguard_interface.assert_called_once()
+
+    def test_manual_stop_releases_every_phone_heard(self):
+        coordinator, routing, clients, _ = self.make([self.A, self.B])
+        manual_stop(routing, coordinator.discovery, coordinator, listen=0)
+        routing.teardown_wireguard_interface.assert_called_once()
+        clients["phoneA"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
+        clients["phoneB"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
 
     def test_activate_without_phones(self):
         coordinator, _, _, fake_activate = self.make([])
@@ -373,7 +572,7 @@ class TestFailoverCoordinator:
 
     @patch("watchdog.check_tunnel_canary", return_value=False)
     def test_tunnel_lost_after_threshold(self, _canary):
-        coordinator, _, _, fake_activate = self.make(["10.20.0.10"])
+        coordinator, _, _, fake_activate = self.make([self.A])
         with patch("watchdog.activate_failover", side_effect=fake_activate):
             coordinator.activate()
         assert coordinator.tunnel_lost() is False
@@ -381,32 +580,32 @@ class TestFailoverCoordinator:
         assert coordinator.tunnel_lost() is True
 
     def test_tunnel_success_resets_failures(self):
-        coordinator, _, _, fake_activate = self.make(["10.20.0.10"])
+        coordinator, _, _, fake_activate = self.make([self.A])
         with patch("watchdog.activate_failover", side_effect=fake_activate):
             coordinator.activate()
         with patch("watchdog.check_tunnel_canary", side_effect=[False, False, True, False, False]):
             assert [coordinator.tunnel_lost() for _ in range(5)] == [False, False, False, False, False]
 
     def test_hand_over_prefers_another_phone(self):
-        coordinator, _, clients, fake_activate = self.make(["10.20.0.10", "10.20.0.11"])
+        coordinator, _, clients, fake_activate = self.make([self.A, self.B])
         with patch("watchdog.activate_failover", side_effect=fake_activate):
             coordinator.activate()
-            assert coordinator.active_phone_ip == "10.20.0.10"
+            assert coordinator.active_phone == self.A
             assert coordinator.hand_over() is True
-        assert coordinator.active_phone_ip == "10.20.0.11"
+        assert coordinator.active_phone == self.B
         # Lost phone was asked (best effort) to release cellular
-        clients["10.20.0.10"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
+        clients["phoneA"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
 
     def test_hand_over_retries_same_phone_when_alone(self):
         # e.g. the app restarted: the same phone comes back with a fresh relay
-        coordinator, _, _, fake_activate = self.make(["10.20.0.10"])
+        coordinator, _, _, fake_activate = self.make([self.A])
         with patch("watchdog.activate_failover", side_effect=fake_activate):
             coordinator.activate()
             assert coordinator.hand_over() is True
-        assert coordinator.active_phone_ip == "10.20.0.10"
+        assert coordinator.active_phone == self.A
 
     def test_hand_over_fails_when_no_phone_left(self):
-        coordinator, routing, _, fake_activate = self.make(["10.20.0.10"])
+        coordinator, routing, _, fake_activate = self.make([self.A])
         with patch("watchdog.activate_failover", side_effect=fake_activate):
             coordinator.activate()
             coordinator.discovery.phones = []
@@ -415,10 +614,10 @@ class TestFailoverCoordinator:
         routing.disable_routing_and_nat.assert_called()
 
     def test_release_tolerates_unreachable_phone(self):
-        coordinator, _, clients, fake_activate = self.make(["10.20.0.10"])
+        coordinator, _, clients, fake_activate = self.make([self.A])
         with patch("watchdog.activate_failover", side_effect=fake_activate):
             coordinator.activate()
-        clients["10.20.0.10"].stop_failover.side_effect = ConnectionError("gone")
+        clients["phoneA"].stop_failover.side_effect = ConnectionError("gone")
         coordinator.deactivate()
         assert coordinator.active is False
 
@@ -441,6 +640,8 @@ class TestArgParsing:
         assert args.restore_threshold == 5
         assert args.check_interval == 5
         assert args.tunnel_fail_threshold == 3
+        assert args.config_dir == "/config"
+        assert args.phone is None
 
     def test_custom_arguments(self):
         args = parse_args([
@@ -450,7 +651,8 @@ class TestArgParsing:
             "--table-id", "200",
             "--no-clamp-mss",
             "--ping-timeout", "4",
-            "--phone-ip", "10.0.0.123",
+            "--phone", "Pixel",
+            "--config-dir", "/tmp/cfg",
             "--http-port", "9090",
             "--discovery-port", "9091",
             "--fail-threshold", "2",
@@ -464,7 +666,8 @@ class TestArgParsing:
         assert args.table_id == 200
         assert args.clamp_mss is False
         assert args.ping_timeout == 4
-        assert args.phone_ip == "10.0.0.123"
+        assert args.phone == "Pixel"
+        assert args.config_dir == "/tmp/cfg"
         assert args.http_port == 9090
         assert args.discovery_port == 9091
         assert args.fail_threshold == 2

@@ -1,18 +1,25 @@
 package com.example.cellularwanfailover.controller
 
 import android.content.Context
+import android.os.Build
+import android.provider.Settings
 import android.util.Log
+import com.example.cellularwanfailover.auth.AndroidPairingKeyStore
+import com.example.cellularwanfailover.auth.GatewayAuthenticator
+import com.example.cellularwanfailover.auth.GatewayPairing
+import com.example.cellularwanfailover.auth.PairingInvite
+import com.example.cellularwanfailover.auth.PairingRepository
+import com.example.cellularwanfailover.auth.PairingState
 import com.example.cellularwanfailover.discovery.DiscoveryBroadcaster
 import com.example.cellularwanfailover.http.ControlHttpServer
 import com.example.cellularwanfailover.http.FailoverControlDelegate
+import com.example.cellularwanfailover.http.FailoverStartResult
 import com.example.cellularwanfailover.model.CellularState
 import com.example.cellularwanfailover.model.FailoverState
 import com.example.cellularwanfailover.model.LogEntry
-import com.example.cellularwanfailover.model.TrustedNetwork
 import com.example.cellularwanfailover.model.WifiNetworkInfo
 import com.example.cellularwanfailover.network.CellularNetworkManager
 import com.example.cellularwanfailover.network.NetworkUtils
-import com.example.cellularwanfailover.network.TrustedNetworkManager
 import com.example.cellularwanfailover.network.WifiTrustMonitor
 import com.wireguard.crypto.Key
 import kotlinx.coroutines.CoroutineScope
@@ -23,10 +30,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 
 import com.example.cellularwanfailover.wireguard.WireGuardManager
 
@@ -37,6 +47,10 @@ class FailoverController private constructor(
     companion object {
         private const val TAG = "FailoverController"
         private const val MAX_LOGS = 200
+        private const val PAIRING_TIMEOUT_MS = 5 * 60_000L
+        // Replaced by gateway pairings (each pairing trusts the Wi-Fi it was made on)
+        private const val LEGACY_TRUSTED_NETWORKS_PREFS = "trusted_networks_prefs"
+        private const val UNKNOWN_SSID = "<unknown ssid>"
 
         @Volatile
         private var instance: FailoverController? = null
@@ -53,18 +67,24 @@ class FailoverController private constructor(
 
     val cellularManager = CellularNetworkManager(appContext)
     val wireGuardManager = WireGuardManager(appContext)
-    val httpServer = ControlHttpServer(port = 8989, delegate = this)
-    val broadcaster = DiscoveryBroadcaster(
-        httpPort = 8989,
-        broadcastPort = 8990,
-        wifiNetworkProvider = { NetworkUtils.getWifiNetwork(appContext) }
+    private val pairingRepository = PairingRepository(
+        appContext.getSharedPreferences(PairingRepository.PREFS_NAME, Context.MODE_PRIVATE),
+        AndroidPairingKeyStore()
     )
-    val trustedNetworkManager = TrustedNetworkManager(appContext)
-    val wifiTrustMonitor = WifiTrustMonitor(appContext, trustedNetworkManager)
+    val authenticator = GatewayAuthenticator(pairingRepository)
+    val httpServer = ControlHttpServer(port = 8989, delegate = this, authenticator = authenticator)
+    val broadcaster = DiscoveryBroadcaster(
+        broadcastPort = 8990,
+        wifiNetworkProvider = { NetworkUtils.getWifiNetwork(appContext) },
+        payloadProvider = { authenticator.discoveryPayload(currentSsid, _wifiIp.value) }
+    )
+    // Gateway services run on the networks of the phone's pairings (and of a pairing in progress)
+    val wifiTrustMonitor = WifiTrustMonitor(appContext, authenticator::isServiceSsid, authenticator.trustChanges)
 
     val isNetworkTrusted: StateFlow<Boolean> = wifiTrustMonitor.isNetworkTrusted
     val currentWifiNetwork: StateFlow<WifiNetworkInfo?> = wifiTrustMonitor.currentWifiInfo
-    val trustedNetworks: StateFlow<List<TrustedNetwork>> = trustedNetworkManager.trustedNetworks
+    val pairings: StateFlow<List<GatewayPairing>> = authenticator.pairings
+    val pairingState: StateFlow<PairingState> = authenticator.pairingState
 
     private val _failoverState = MutableStateFlow(FailoverState.IDLE)
     val failoverState: StateFlow<FailoverState> = _failoverState.asStateFlow()
@@ -82,6 +102,11 @@ class FailoverController private constructor(
     val logs: StateFlow<List<LogEntry>> = _logs.asStateFlow()
 
     private var monitorJob: Job? = null
+    private var pairingJob: Job? = null
+
+    // Gateway that started the active failover: only it may stop it, others get "busy"
+    @Volatile
+    private var activeGatewayId: String? = null
 
     // FailoverControlDelegate properties
     override val failoverStatusString: String
@@ -89,6 +114,14 @@ class FailoverController private constructor(
 
     override val currentWifiIp: String?
         get() = _wifiIp.value
+
+    override val currentSsid: String?
+        get() = wifiTrustMonitor.currentWifiInfo.value?.ssid?.takeIf { it != UNKNOWN_SSID }
+
+    override val deviceName: String
+        get() = Settings.Global.getString(appContext.contentResolver, Settings.Global.DEVICE_NAME)
+            ?.takeIf { it.isNotBlank() }
+            ?: "${Build.MANUFACTURER} ${Build.MODEL}".trim()
 
     override val isCellularReady: Boolean
         get() = _cellularState.value == CellularState.CONNECTED
@@ -112,6 +145,8 @@ class FailoverController private constructor(
         // Forward logs from components
         wireGuardManager.onLog = { msg, isErr -> logEvent("WireGuard", msg, isErr) }
         broadcaster.onLog = { msg, isErr -> logEvent("Discovery", msg, isErr) }
+
+        appContext.deleteSharedPreferences(LEGACY_TRUSTED_NETWORKS_PREFS)
 
         // Observe cellular state changes
         scope.launch {
@@ -148,7 +183,7 @@ class FailoverController private constructor(
     private fun resumeGatewayServices() {
         refreshWifiIp()
         val ssid = wifiTrustMonitor.currentWifiInfo.value?.ssid ?: "Wi-Fi"
-        logEvent("FailoverController", "Connected to trusted network ($ssid). Starting gateway services...")
+        logEvent("FailoverController", "Connected to a paired network ($ssid). Starting gateway services...")
 
         // Bound to the current Wi-Fi IP only; the monitoring loop keeps it in sync
         ensureHttpServer()
@@ -191,7 +226,7 @@ class FailoverController private constructor(
     }
 
     private fun pauseGatewayServices() {
-        logEvent("FailoverController", "Untrusted network or mobile data alone. Halting gateway services (Paused)...")
+        logEvent("FailoverController", "No paired gateway on this network (or mobile data alone). Halting gateway services (Paused)...")
         monitorJob?.cancel()
         monitorJob = null
 
@@ -215,22 +250,68 @@ class FailoverController private constructor(
         pauseGatewayServices()
     }
 
-    fun addCurrentNetwork(): Boolean {
-        val info = wifiTrustMonitor.currentWifiInfo.value ?: return false
-        if (info.ssid == "<unknown ssid>" || info.ssid.isBlank()) return false
-        val added = trustedNetworkManager.addNetwork(info.ssid, info.bssid)
-        if (added) {
-            logEvent("FailoverController", "Added current network '${info.ssid}' to trusted whitelist")
+    sealed interface PairingStartResult {
+        data object Started : PairingStartResult
+        data object NoWifi : PairingStartResult
+        /** Android hides the Wi-Fi name (location permission or location services off) */
+        data object WifiNameUnknown : PairingStartResult
+    }
+
+    /**
+     * Starts pairing with the gateway of [invite] on the current Wi-Fi network. Nothing is saved
+     * until that gateway reaches the phone over this network (see GatewayAuthenticator); the
+     * pairing is dropped after [PAIRING_TIMEOUT_MS] or if the phone leaves the network first.
+     */
+    fun beginPairing(invite: PairingInvite): PairingStartResult {
+        refreshWifiNetworkInfo()
+        val wifi = wifiTrustMonitor.currentWifiInfo.value ?: return PairingStartResult.NoWifi
+        val ssid = wifi.ssid.takeIf { it != UNKNOWN_SSID } ?: return PairingStartResult.WifiNameUnknown
+
+        pairingJob?.cancel()
+        authenticator.beginPairing(invite, ssid)
+        // Re-read the Wi-Fi now that it counts as trusted: this connection is then remembered as
+        // verified, so it stays recognized if Android hides the SSID once the app is in the background
+        wifiTrustMonitor.refresh()
+        logEvent("Pairing", "Waiting for gateway '${invite.gatewayName}' to answer on Wi-Fi '$ssid'...")
+
+        pairingJob = scope.launch {
+            val outcome = withTimeoutOrNull(PAIRING_TIMEOUT_MS) {
+                combine(authenticator.pairingState, wifiTrustMonitor.currentWifiInfo) { state, current -> state to current?.ssid }
+                    .first { (state, currentSsid) ->
+                        state !is PairingState.Waiting || state.phoneId != invite.phoneId || currentSsid != ssid
+                    }
+            }
+            val reason = when {
+                outcome == null ->
+                    "Gateway '${invite.gatewayName}' didn't answer on Wi-Fi '$ssid'. Is it on this network?"
+                (outcome.first as? PairingState.Waiting)?.phoneId == invite.phoneId ->
+                    "The phone left Wi-Fi '$ssid' before gateway '${invite.gatewayName}' answered."
+                else -> null // paired (or replaced by another pairing)
+            }
+            if (reason != null) {
+                authenticator.cancelPairing(reason)
+                logEvent("Pairing", reason, true)
+            }
         }
-        return added
+        broadcaster.broadcastNow()
+        return PairingStartResult.Started
     }
 
-    fun removeTrustedNetwork(id: String): Boolean {
-        return trustedNetworkManager.removeNetwork(id)
+    fun cancelPairing() {
+        pairingJob?.cancel()
+        authenticator.cancelPairing("Pairing cancelled.")
     }
 
-    fun clearTrustedNetworks() {
-        trustedNetworkManager.clearAll()
+    fun acknowledgePairingResult() {
+        authenticator.acknowledgePairingResult()
+    }
+
+    fun removeGateway(gatewayId: String) {
+        val removed = authenticator.removePairing(gatewayId) ?: return
+        logEvent("Pairing", "Removed gateway '${removed.gatewayName}' (Wi-Fi '${removed.ssid}')")
+        if (activeGatewayId == gatewayId) {
+            scope.launch { stopFailover() }
+        }
     }
 
     fun refreshWifiNetworkInfo() {
@@ -238,11 +319,17 @@ class FailoverController private constructor(
         refreshWifiIp()
     }
 
-    override suspend fun startFailover(gatewayPublicKey: Key): Boolean {
+    override suspend fun startFailover(gatewayPublicKey: Key, gatewayId: String): FailoverStartResult {
         mutex.withLock {
             if (!wifiTrustMonitor.isNetworkTrusted.value) {
                 logEvent("FailoverController", "Cannot start failover: untrusted network or mobile data alone", true)
-                return false
+                return FailoverStartResult.Failed("Phone is not on a paired Wi-Fi network")
+            }
+
+            val owner = activeGatewayId
+            if (_failoverState.value == FailoverState.ACTIVE && owner != null && owner != gatewayId) {
+                logEvent("FailoverController", "Refused failover start: relay in use by another gateway", true)
+                return FailoverStartResult.Busy
             }
 
             // The relay is bound to the Wi-Fi network so replies reach the gateway even when
@@ -251,7 +338,7 @@ class FailoverController private constructor(
             val bindAddress = wifiNetwork?.let { NetworkUtils.getIpv4Address(appContext, it) }
             if (wifiNetwork == null || bindAddress == null) {
                 logEvent("FailoverController", "Cannot start failover: no Wi-Fi network to bind the relay to", true)
-                return false
+                return FailoverStartResult.Failed("No Wi-Fi network to bind the relay to")
             }
 
             if (_failoverState.value == FailoverState.ACTIVE) {
@@ -276,28 +363,46 @@ class FailoverController private constructor(
                     throw e
                 }
 
+                activeGatewayId = gatewayId
                 _failoverState.value = FailoverState.ACTIVE
                 logEvent("FailoverController", "WireGuard relay active and operational")
-                true
+                FailoverStartResult.Started
             } catch (e: Exception) {
                 _failoverState.value = FailoverState.ERROR
                 logEvent("FailoverController", "Cellular activation failed: ${e.message}", true)
                 wireGuardManager.stop()
                 cellularManager.releaseCellular()
+                activeGatewayId = null
                 _failoverState.value = FailoverState.IDLE
-                false
+                FailoverStartResult.Failed("Cellular connection failed: ${e.message}")
             }
         }
     }
 
-    override suspend fun stopFailover() {
+    override suspend fun stopFailover(gatewayId: String): Boolean {
         mutex.withLock {
-            logEvent("FailoverController", "Deactivating failover relay...")
-            wireGuardManager.stop()
-            cellularManager.releaseCellular()
-            _failoverState.value = FailoverState.IDLE
-            logEvent("FailoverController", "WireGuard relay stopped, mobile cellular radio released")
+            val owner = activeGatewayId
+            if (_failoverState.value != FailoverState.IDLE && owner != null && owner != gatewayId) {
+                logEvent("FailoverController", "Refused failover stop: relay in use by another gateway", true)
+                return false
+            }
+            stopRelayLocked()
+            return true
         }
+    }
+
+    /** Stops the relay whichever gateway started it (user action, network change...). */
+    suspend fun stopFailover() {
+        mutex.withLock { stopRelayLocked() }
+    }
+
+    private fun stopRelayLocked() {
+        logEvent("FailoverController", "Deactivating failover relay...")
+        wireGuardManager.stop()
+        cellularManager.releaseCellular()
+        activeGatewayId = null
+        _failoverState.value = FailoverState.IDLE
+        logEvent("FailoverController", "WireGuard relay stopped, mobile cellular radio released")
     }
 
     fun refreshWifiIp() {

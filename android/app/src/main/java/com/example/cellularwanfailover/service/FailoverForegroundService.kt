@@ -124,7 +124,7 @@ class FailoverForegroundService : Service() {
         )
 
         val statusSubtitle = if (!isTrusted) {
-            "Paused (Untrusted Network)"
+            "Paused (no paired gateway on this Wi-Fi)"
         } else {
             when (state) {
                 FailoverState.IDLE -> "State: Standby (Wi-Fi active)"

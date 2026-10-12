@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 11 and lower: keep WireGuard private keys out of backups -->
+<!-- Android 11 and lower: keep WireGuard private keys and gateway pairings out of backups -->
 <full-backup-content>
     <exclude domain="sharedpref" path="wireguard_settings.xml" />
+    <!-- Pairing secrets stay in the Android Keystore of this phone; a restored list would be useless -->
+    <exclude domain="sharedpref" path="gateway_pairings.xml" />
 </full-backup-content>

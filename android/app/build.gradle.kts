@@ -87,6 +87,9 @@ dependencies {
     // WireGuard crypto KeyPair (version 1.0.20260102 with 16 KB page size alignment)
     implementation("com.wireguard.android:tunnel:1.0.20260102")
 
+    // Google Code Scanner: scans the gateway pairing QR code without the camera permission
+    implementation(libs.play.services.code.scanner)
+
     testImplementation(libs.junit)
     testImplementation(libs.kotlinx.coroutines.test)
     testImplementation(libs.ktor.server.test.host)

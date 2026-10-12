@@ -1,31 +1,33 @@
 package com.example.cellularwanfailover.discovery
 
 import android.net.Network
-import android.os.Build
 import android.util.Log
-import com.example.cellularwanfailover.model.DiscoveryMessage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.serialization.encodeToString
-import kotlinx.serialization.json.Json
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.concurrent.atomic.AtomicBoolean
 
+/**
+ * Announces the phone to its paired gateways on the Wi-Fi network: one UDP broadcast every
+ * [intervalMillis] carrying a signature per gateway paired on that network (see PROTOCOL.md).
+ */
 class DiscoveryBroadcaster(
-    private val httpPort: Int = 8989,
     private val broadcastPort: Int = 8990,
     private val intervalMillis: Long = 5000L,
     /** Wi-Fi network to send on; without it broadcasts follow the default network (cellular during an outage) */
-    private val wifiNetworkProvider: () -> Network? = { null }
+    private val wifiNetworkProvider: () -> Network? = { null },
+    /** Signed payload for the current network, or null when no gateway is paired on it */
+    private val payloadProvider: () -> ByteArray? = { null }
 ) {
     companion object {
         private const val TAG = "DiscoveryBroadcaster"
@@ -38,6 +40,13 @@ class DiscoveryBroadcaster(
 
     var onLog: ((message: String, isError: Boolean) -> Unit)? = null
 
+    // Wakes the loop up to broadcast right away (e.g. a pairing just started)
+    private val wakeUp = Channel<Unit>(Channel.CONFLATED)
+
+    fun broadcastNow() {
+        wakeUp.trySend(Unit)
+    }
+
     @Synchronized
     fun start() {
         if (_isRunning.getAndSet(true)) return
@@ -47,18 +56,15 @@ class DiscoveryBroadcaster(
 
         job = newScope.launch {
             log("UDP Discovery broadcaster started on port $broadcastPort (every ${intervalMillis / 1000}s)")
-            val deviceModel = "${Build.MANUFACTURER} ${Build.MODEL}".trim()
-            val msg = DiscoveryMessage(
-                device = if (deviceModel.isNotBlank()) deviceModel else "Android Device",
-                service = "wan-failover",
-                port = httpPort
-            )
-            val jsonSerializer = Json { encodeDefaults = true }
-            val jsonPayload = jsonSerializer.encodeToString(msg).toByteArray(Charsets.UTF_8)
 
             while (isActive) {
                 var socket: DatagramSocket? = null
                 try {
+                    val jsonPayload = payloadProvider()
+                    if (jsonPayload == null) {
+                        withTimeoutOrNull(intervalMillis) { wakeUp.receive() }
+                        continue
+                    }
                     socket = DatagramSocket()
                     socket.broadcast = true
                     wifiNetworkProvider()?.bindSocket(socket)
@@ -100,7 +106,7 @@ class DiscoveryBroadcaster(
                     try { socket?.close() } catch (_: Exception) {}
                 }
 
-                delay(intervalMillis)
+                withTimeoutOrNull(intervalMillis) { wakeUp.receive() }
             }
         }
     }

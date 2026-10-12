@@ -2,7 +2,7 @@
 #
 # Control and test utility for the Cellular WAN Failover Gateway.
 # Installed in the gateway image as /usr/local/bin/wanctl; run it from the host with:
-#   docker exec -it wan-failover-gateway wanctl <action> [PHONE_IP]
+#   docker exec -it wan-failover-gateway wanctl <action> [PHONE]
 #
 set -euo pipefail
 
@@ -10,31 +10,54 @@ WATCHDOG="${WATCHDOG:-/app/watchdog.py}"
 PRIMARY_IFACE="${PRIMARY_IFACE:-eth0}"
 
 ACTION="${1:-help}"
-PHONE_IP="${2:-${PHONE_IP:-}}"
+# Paired phone, by name or ID (see 'wanctl phones')
+PHONE="${2:-}"
 
 run_gateway() {
     python3 "$WATCHDOG" "$@"
 }
 
 EXTRA_ARGS=()
-if [ -n "$PHONE_IP" ]; then
-    EXTRA_ARGS+=(--phone-ip "$PHONE_IP")
+if [ -n "$PHONE" ]; then
+    EXTRA_ARGS+=(--phone "$PHONE")
 fi
 
 usage() {
-    echo "Usage: wanctl <action> [PHONE_IP]"
-    echo "From the host: docker exec -it wan-failover-gateway wanctl <action> [PHONE_IP]"
+    echo "Usage: wanctl <action> [PHONE]"
+    echo "From the host: docker exec -it wan-failover-gateway wanctl <action> [PHONE]"
+    echo "PHONE is a paired smartphone's name or ID (see 'wanctl phones')."
     echo ""
     echo "Available actions:"
-    echo "  discover           : Listen to network and display smartphone IP"
-    echo "  status [IP]        : Query Android service status (/v1/status)"
-    echo "  start [IP]         : Force immediate activation of WireGuard failover"
-    echo "  stop [IP]          : Stop failover and restore normal state"
+    echo "  pair               : Show a QR code to pair a smartphone (scan it in the app)"
+    echo "  phones             : List paired smartphones and whether they are online"
+    echo "  unpair <PHONE>     : Remove a paired smartphone"
+    echo "  discover           : Listen to network and display a paired smartphone"
+    echo "  status [PHONE]     : Query Android service status (/v1/status)"
+    echo "  start [PHONE]      : Force immediate activation of WireGuard failover"
+    echo "  stop               : Stop failover and restore normal state"
     echo "  test-probe         : Test ping probe via primary interface ($PRIMARY_IFACE)"
     echo "  test-route         : Verify if egress path is direct (WAN 1) or hairpinned (WAN 2)"
 }
 
 case "$ACTION" in
+    pair)
+        echo "=== Pairing a smartphone ==="
+        run_gateway --pair
+        ;;
+
+    phones)
+        echo "=== Paired smartphones ==="
+        run_gateway --list-phones
+        ;;
+
+    unpair)
+        if [ -z "$PHONE" ]; then
+            echo "Usage: wanctl unpair <PHONE>   (name or ID, see 'wanctl phones')" >&2
+            exit 1
+        fi
+        run_gateway --unpair "$PHONE"
+        ;;
+
     discover)
         echo "=== Searching for smartphone via UDP broadcast ==="
         run_gateway --discover-only
@@ -52,7 +75,7 @@ case "$ACTION" in
 
     stop)
         echo "=== Stopping cellular failover ==="
-        run_gateway --stop-now "${EXTRA_ARGS[@]}"
+        run_gateway --stop-now
         ;;
 
     test-probe)

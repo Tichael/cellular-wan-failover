@@ -8,7 +8,8 @@ RUN apk add --no-cache \
     wireguard-tools \
     python3 \
     iputils \
-    bash
+    bash \
+    libqrencode-tools
 
 # Default environment configuration
 ENV PRIMARY_IFACE=eth0 \
@@ -24,7 +25,8 @@ ENV PRIMARY_IFACE=eth0 \
     ROUTING_TABLE_ID=100 \
     WG_IFACE=wg0 \
     CLAMP_MSS=true \
-    PHONE_IP="" \
+    CONFIG_DIR=/config \
+    GATEWAY_NAME="" \
     HTTP_PORT=8989 \
     DISCOVERY_PORT=8990 \
     PING_TARGETS="1.1.1.1 8.8.8.8" \
@@ -37,8 +39,12 @@ ENV PRIMARY_IFACE=eth0 \
 
 WORKDIR /app
 
+# Gateway ID and paired phones (with their secrets): keep it on a volume
+VOLUME /config
+
 # Copy scripts
 COPY watchdog.py /app/watchdog.py
+COPY pairing.py /app/pairing.py
 COPY entrypoint.sh /app/entrypoint.sh
 COPY wanctl /usr/local/bin/wanctl
 
