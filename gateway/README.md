@@ -116,6 +116,7 @@ services:
       - FAIL_THRESHOLD=3
       - RESTORE_THRESHOLD=5
       - CHECK_INTERVAL=5
+      - HOT_STANDBY=true   # Always-on tunnel with phones that offer it (see "Hot standby")
       # Name shown on phones when pairing (default: host name)
       # - GATEWAY_NAME=Home gateway
     volumes:
@@ -191,7 +192,13 @@ docker run -d \
      - However, the smartphone's userspace WireGuard relay synthesizes ICMP Echo Replies for all ICMP requests entering the tunnel.
      - **If the router routes traffic via WAN 2**: `198.18.0.1` is forwarded through WAN 2 -> `wg0` -> phone replies -> canary probe succeeds. The watchdog knows LAN traffic is still hairpinned through cellular backup and remains in failover standby.
      - **If the router switches back to WAN 1**: `198.18.0.1` is sent out WAN 1 and dropped by the ISP -> canary probe times out! The watchdog now tests public targets (`1.1.1.1`, `8.8.8.8`) via `eth0`.
-   - After 5 consecutive direct successes on WAN 1, the Pi cleanly tears down iptables NAT rules, drops `wg0`, and signals the smartphone (`POST /v1/failover/stop`) to return cellular to low-power standby.
+   - After 5 consecutive direct successes on WAN 1, the Pi cleanly tears down iptables NAT rules, drops `wg0`, and signals the smartphone (`POST /v1/failover/stop`) to return cellular to low-power standby. A phone in hot standby keeps its tunnel instead.
+7. **Hot Standby** (`HOT_STANDBY=true`, default) :
+   - Phones announce in their signed beacons whether they offer hot standby (app setting *Standby Mode*, e.g. only while plugged in).
+   - While WAN 1 works and a phone offers it, the watchdog activates failover right away (same steps as above), so the router sees WAN 2 online at all times. Before that, the phone's signed `/v1/status` must confirm `"standby": "hot"`, and it is confirmed again every 60 s: a replayed beacon can't keep the tunnel up.
+   - The tunnel is never restarted when an outage starts: the router simply switches to WAN 2 (seen by the canary from `eth0`).
+   - A phone that stops offering it is released right away, except while the router uses WAN 2: then it carries the outage until WAN 1 is back.
+   - Failed activations are retried after 30 s, then up to every 5 minutes.
 
 ---
 
