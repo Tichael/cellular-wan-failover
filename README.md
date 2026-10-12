@@ -106,10 +106,7 @@ mobile-wan-backup/
    ```bash
    docker compose up -d
    ```
-4. **Verify status** :
-   ```bash
-   docker exec -it wan-failover-gateway wanctl status
-   ```
+4. **Pair the phone** (see Step 3).
 
 #### Option B: Deploy with standalone `compose.yaml` (No Git clone needed)
 Create `compose.yaml` on the host:
@@ -145,8 +142,27 @@ services:
       - CHECK_INTERVAL=5
     volumes:
       - /lib/modules:/lib/modules:ro
+      - gateway-config:/config   # Gateway ID and paired phones
+
+volumes:
+  gateway-config:
 ```
 Run: `docker compose up -d`
+
+### Step 3: Pair each phone with the gateway
+
+The gateway only works with phones it is paired with, and every message between them is signed (see [PROTOCOL.md](PROTOCOL.md)). Repeat this for each phone (e.g. every adult in a family):
+
+1. Connect the phone to the Wi-Fi network the gateway is on. The pairing is tied to that network: the app only acts as a relay while connected to it.
+2. On the gateway, run:
+   ```bash
+   docker exec -it wan-failover-gateway wanctl pair
+   ```
+   It prints a QR code and a `wanfailover://pair?...` link, valid for one phone and 5 minutes.
+3. Scan the QR code with the app (**Scan Gateway QR**) or the camera app, or paste the link (**Paste Link**), then confirm.
+4. The gateway finishes the pairing over the Wi-Fi network and prints `✓ Paired with '<phone name>'`. Check with `wanctl phones`.
+
+A phone can be paired with several gateways (e.g. home and cottage), each on its own Wi-Fi network. If the Wi-Fi name changes, pair again. To remove a phone, run `wanctl unpair <name>` on the gateway and remove the gateway in the app.
 
 ---
 
@@ -155,10 +171,15 @@ Run: `docker compose up -d`
 The gateway image ships with the [`wanctl`](gateway/wanctl) CLI, so nothing needs to be installed on the host. Run it with `docker exec`:
 
 ```bash
-# Check smartphone status, relay state, and transmitted bytes
+# Pair a smartphone (QR code), list paired phones, remove one
+docker exec -it wan-failover-gateway wanctl pair
+docker exec -it wan-failover-gateway wanctl phones
+docker exec -it wan-failover-gateway wanctl unpair "<phone name>"
+
+# Check smartphone status, relay state, and transmitted bytes (optionally: wanctl status "<phone name>")
 docker exec -it wan-failover-gateway wanctl status
 
-# Discover smartphone IP on local Wi-Fi via UDP beacons (port 8990)
+# Discover a paired smartphone on local Wi-Fi via signed UDP beacons (port 8990)
 docker exec -it wan-failover-gateway wanctl discover
 
 # Manually trigger cellular failover activation
@@ -187,7 +208,7 @@ Optional shortcut on the host: `alias wanctl='docker exec -it wan-failover-gatew
 ## 6. Automated Production Behavior
 
 1. **Continuous Monitoring** : The watchdog continuously monitors WAN 1 (`eth0`) using periodic ICMP pings to `1.1.1.1` and `8.8.8.8`.
-2. **Outage Detection** : Upon 3 consecutive ping failures, the watchdog invokes the phone's local HTTP API (`POST /v1/failover/start`).
+2. **Outage Detection** : Upon 3 consecutive ping failures, the watchdog invokes the phone's local HTTP API (`POST /v1/failover/start`). Every request and answer is signed with that phone's pairing secret, and the phone only accepts it on the Wi-Fi network it was paired on ([PROTOCOL.md](PROTOCOL.md)).
 3. **Instant Failover** : The Pi generates a fresh WireGuard key pair for this activation and sends only its public key in the start request. The phone activates cellular data and starts its userspace WireGuard relay, keyed to that public key. The phone's HTTP API (`8989`) and relay (`51820`) listen on its Wi-Fi address only, never on the cellular interface. The Pi builds its own `wg0` config from validated fields, brings up `wg0`, sets up Table 100 policy routing, and configures iptables MASQUERADE. The router detects WAN 2 healthy and routes all LAN traffic through it.
 4. **Tunnel Canary Verification & Automatic Recovery (Failback)** : While failover is active, the watchdog probes a non-routable benchmark IP (`198.18.0.1`, RFC 2544 / RFC 6890). If LAN default traffic is routed out WAN 2, the phone's WireGuard relay synthesizes replies and the canary succeeds, keeping failover active without flapping. Once primary WAN 1 recovers and the router switches its default route back to WAN 1, the canary times out (ISPs drop `198.18.0.1`). The watchdog then verifies direct internet connectivity via primary WAN 1 (`1.1.1.1`). After 5 consecutive direct successes, the Pi tears down `wg0`, flushes routing tables, and signals the phone to release cellular data (`POST /v1/failover/stop`).
 

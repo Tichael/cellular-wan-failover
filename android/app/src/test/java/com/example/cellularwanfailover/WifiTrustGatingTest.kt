@@ -2,41 +2,32 @@ package com.example.cellularwanfailover
 
 import com.example.cellularwanfailover.model.FailoverState
 import com.example.cellularwanfailover.model.WifiNetworkInfo
-import com.example.cellularwanfailover.network.TrustedNetworkManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
-import org.junit.Before
 import org.junit.Test
 
 class WifiTrustGatingTest {
 
-    private lateinit var fakePrefs: FakeSharedPreferences
-    private lateinit var trustedNetworkManager: TrustedNetworkManager
-
-    @Before
-    fun setUp() {
-        fakePrefs = FakeSharedPreferences()
-        trustedNetworkManager = TrustedNetworkManager(fakePrefs, kotlinx.coroutines.Dispatchers.Unconfined)
-    }
-
     @Test
     fun testDynamicTrustEvaluation() {
+        // Trusted networks are the Wi-Fi networks of the phone's gateway pairings
+        val auth = newAuthenticator()
         val currentSsid = MutableStateFlow<String?>("MyHomeNetwork")
         val isNetworkTrusted = MutableStateFlow(false)
 
         fun reevaluate() {
-            val ssid = currentSsid.value
-            isNetworkTrusted.value = trustedNetworkManager.isTrusted(ssid)
+            isNetworkTrusted.value = auth.isServiceSsid(currentSsid.value)
         }
 
-        // Initially untrusted because whitelist is empty
+        // Initially untrusted: nothing paired
         reevaluate()
         assertFalse(isNetworkTrusted.value)
 
-        // Add home network to whitelist
-        trustedNetworkManager.addNetwork("MyHomeNetwork")
+        // Pair a gateway on the home network
+        val gateway = TestGateway()
+        auth.pair(gateway, "MyHomeNetwork")
         reevaluate()
         assertTrue(isNetworkTrusted.value)
 
@@ -55,9 +46,8 @@ class WifiTrustGatingTest {
         reevaluate()
         assertTrue(isNetworkTrusted.value)
 
-        // Remove home Wi-Fi from whitelist
-        val homeId = trustedNetworkManager.trustedNetworks.value.first { it.ssid == "MyHomeNetwork" }.id
-        trustedNetworkManager.removeNetwork(homeId)
+        // Remove the gateway: its network is no longer trusted
+        auth.removePairing(gateway.gatewayId)
         reevaluate()
         assertFalse(isNetworkTrusted.value)
     }
@@ -65,12 +55,12 @@ class WifiTrustGatingTest {
     @Test
     fun testGatingStateControlsNotificationStatus() {
         // Test notification subtitle logic matches requirements:
-        // When untrusted or mobile data alone -> "Paused (Untrusted Network)"
+        // When untrusted or mobile data alone -> "Paused (no paired gateway on this Wi-Fi)"
         // When trusted -> "State: Standby (Wi-Fi active)" or "State: Active (4G/5G failover running)"
 
         fun computeNotificationSubtitle(state: FailoverState, isTrusted: Boolean): String {
             return if (!isTrusted) {
-                "Paused (Untrusted Network)"
+                "Paused (no paired gateway on this Wi-Fi)"
             } else {
                 when (state) {
                     FailoverState.IDLE -> "State: Standby (Wi-Fi active)"
@@ -87,9 +77,9 @@ class WifiTrustGatingTest {
         assertEquals("State: Active (4G/5G failover running)", computeNotificationSubtitle(FailoverState.ACTIVE, true))
 
         // Untrusted on Wi-Fi (even if state was idle or active)
-        assertEquals("Paused (Untrusted Network)", computeNotificationSubtitle(FailoverState.IDLE, false))
-        assertEquals("Paused (Untrusted Network)", computeNotificationSubtitle(FailoverState.ACTIVE, false))
-        assertEquals("Paused (Untrusted Network)", computeNotificationSubtitle(FailoverState.ERROR, false))
+        assertEquals("Paused (no paired gateway on this Wi-Fi)", computeNotificationSubtitle(FailoverState.IDLE, false))
+        assertEquals("Paused (no paired gateway on this Wi-Fi)", computeNotificationSubtitle(FailoverState.ACTIVE, false))
+        assertEquals("Paused (no paired gateway on this Wi-Fi)", computeNotificationSubtitle(FailoverState.ERROR, false))
     }
 
     @Test

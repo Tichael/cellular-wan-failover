@@ -54,7 +54,7 @@ sudo modprobe iptable_nat
 
 The gateway runs as a self-contained, lightweight Alpine Docker container.
 
-> **Upgrading:** the gateway and the Android app must be updated together. Newer gateways generate their own WireGuard key and no longer use `GET /v1/wireguard/config`. Older phones still serve it but ignore the gateway key, and newer phones reject start requests that don't include one.
+> **Upgrading:** the gateway and the Android app must be updated together. Since pairing was introduced, every request between them is signed ([PROTOCOL.md](../PROTOCOL.md)): after upgrading, pair each phone with `wanctl pair` (unpaired phones are ignored, and `PHONE_IP` is no longer supported). Keep the `/config` volume: it holds the gateway ID and the paired phones.
 
 ### Configuration (`.env`)
 Copy the provided `.env.example` to `.env` and customize parameters if needed:
@@ -116,8 +116,14 @@ services:
       - FAIL_THRESHOLD=3
       - RESTORE_THRESHOLD=5
       - CHECK_INTERVAL=5
+      # Name shown on phones when pairing (default: host name)
+      # - GATEWAY_NAME=Home gateway
     volumes:
       - /lib/modules:/lib/modules:ro
+      - gateway-config:/config   # Gateway ID and paired phones
+
+volumes:
+  gateway-config:
 ```
 
 Run:
@@ -138,6 +144,7 @@ docker run -d \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
   -v /lib/modules:/lib/modules:ro \
+  -v gateway-config:/config \
   ghcr.io/tichael/cellular-wan-gateway:latest
 ```
 
@@ -152,12 +159,12 @@ docker run -d \
 2. **WAN 1 Monitoring** :
    - Continuously pings `1.1.1.1` and `8.8.8.8` via `eth0` (`ping -I eth0`).
 3. **Smartphone Auto-Discovery** :
-   - Listens for UDP broadcast beacons sent every 5 seconds by the Android app on port `8990`.
-   - Tracks **every** phone running the app (e.g. both adults' phones in a family). A phone is available while its beacons keep arriving (last 15 seconds); only one carries the failover at a time.
+   - Listens for UDP broadcast beacons sent every 5 seconds by the Android app on port `8990`, and only counts a beacon that carries a valid signature from a phone paired with this gateway (`wanctl pair`).
+   - Tracks **every** paired phone (e.g. both adults' phones in a family). A phone is available while its beacons keep arriving (last 15 seconds); only one carries the failover at a time.
    - Handles dynamic smartphone Wi-Fi IP changes automatically with no static DHCP reservation needed.
 4. **Failover Trigger (after 3 consecutive failures)** :
    - Generates a fresh WireGuard key pair locally (`wg genkey`). The private key never leaves the gateway.
-   - Reads the phone's WireGuard public key and port from `GET http://<phone_ip>:8989/v1/status`.
+   - Reads the phone's WireGuard public key and port from `GET http://<phone_ip>:8989/v1/status`. Like every request to the phone, it uses a single-use challenge and is signed with the phone's pairing secret. The answer must be signed by the phone, so another device on the LAN can't substitute its own key ([PROTOCOL.md](../PROTOCOL.md)).
    - Calls `POST http://<phone_ip>:8989/v1/failover/start` with `{"gateway_public_key": "<base64>"}` to activate cellular data and the WireGuard relay on the phone.
    - Builds `/etc/wireguard/wg0.conf` itself from validated fields only (keys, IPv4 addresses, port; mode `0600`). Nothing received from the phone is written verbatim, so the phone cannot inject `PostUp`-style commands.
    - Brings up WireGuard interface `wg0`.
@@ -173,7 +180,7 @@ docker run -d \
      iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
      ```
    - Router detects WAN 2 online and routes local network traffic through it.
-   - If the first available phone fails to activate, the next one is tried.
+   - If the first available phone fails to activate (or answers `409`: it is relaying for another gateway), the next one is tried.
 5. **Lost Phone Handover** :
    - While failover is active, the watchdog also pings the canary IP through `wg0` itself. Only the phone's relay answers it, so this checks the tunnel, the relay and the phone's cellular link end to end.
    - After 3 consecutive failed probes (`TUNNEL_FAIL_THRESHOLD`), the phone is considered lost (app crashed, empty battery, out of Wi-Fi range...). If WAN 1 is reachable again, failover simply ends; otherwise it is handed over to another available phone, or restarted on the same one if it is the only phone left (a fresh key is generated either way).
@@ -193,10 +200,17 @@ docker run -d \
 The image includes the `wanctl` CLI for manual testing and operational control. Run it from the host with `docker exec` (no files needed on the host):
 
 ```bash
-# Discover smartphone on local Wi-Fi
+# Pair a smartphone: shows a QR code to scan in the app (phone on the gateway's Wi-Fi)
+docker exec -it wan-failover-gateway wanctl pair
+
+# List paired smartphones (name, Wi-Fi, online status) / remove one
+docker exec -it wan-failover-gateway wanctl phones
+docker exec -it wan-failover-gateway wanctl unpair "<phone name>"
+
+# Discover a paired smartphone on local Wi-Fi
 docker exec -it wan-failover-gateway wanctl discover
 
-# Check Android gateway status and byte counters
+# Check Android gateway status and byte counters (optionally for one phone: status "<phone name>")
 docker exec -it wan-failover-gateway wanctl status
 
 # Manually trigger WireGuard failover

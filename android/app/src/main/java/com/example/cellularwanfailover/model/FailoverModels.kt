@@ -48,10 +48,8 @@ data class FailoverActionResponse(
 )
 
 @Serializable
-data class DiscoveryMessage(
-    val device: String,
-    val service: String = "wan-failover",
-    val port: Int = 8989
+data class ChallengeResponse(
+    val challenge: String
 )
 
 data class LogEntry(
@@ -65,14 +63,6 @@ data class LogEntry(
         private val nextId = java.util.concurrent.atomic.AtomicLong(0L)
     }
 }
-
-@Serializable
-data class TrustedNetwork(
-    val id: String = java.util.UUID.randomUUID().toString(),
-    val ssid: String,
-    val bssid: String? = null,
-    val addedAt: Long = System.currentTimeMillis()
-)
 
 data class WifiNetworkInfo(
     val ssid: String,

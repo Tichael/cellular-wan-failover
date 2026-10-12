@@ -42,6 +42,30 @@
             </intent-filter>
         </activity>
 
+        <!--
+            Gateway pairing links (wanfailover://pair?...), from the in-app scanner or the camera
+            app. Nothing is paired without the user's confirmation and the gateway answering
+            on the phone's Wi-Fi.
+        -->
+        <activity
+            android:name=".PairingActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:taskAffinity="">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="wanfailover" android:host="pair" />
+            </intent-filter>
+        </activity>
+
+        <!-- Have Google Play services download the QR scanner module ahead of the first scan -->
+        <meta-data
+            android:name="com.google.mlkit.vision.DEPENDENCIES"
+            android:value="barcode_ui" />
+
         <!-- Only the system can send these (protected broadcasts) -->
         <receiver
             android:name=".service.BootReceiver"

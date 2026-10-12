@@ -15,15 +15,22 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
+/**
+ * Follows the phone's Wi-Fi connection and whether it is a network the gateway services
+ * should run on ([isTrusted]: networks of the phone's gateway pairings).
+ */
 class WifiTrustMonitor(
     private val context: Context,
-    private val trustedNetworkManager: TrustedNetworkManager
+    private val isTrusted: (String) -> Boolean,
+    /** Emits when the trusted networks may have changed (pairing added, removed...) */
+    private val trustChanges: Flow<Unit>
 ) {
     companion object {
         private const val TAG = "WifiTrustMonitor"
@@ -39,7 +46,7 @@ class WifiTrustMonitor(
     val isNetworkTrusted: StateFlow<Boolean> = _isNetworkTrusted.asStateFlow()
 
     // Keeps a verified connection trusted while Android hides the SSID (app in background)
-    private val stickyTrust = StickyWifiTrust { ssid -> trustedNetworkManager.isTrusted(ssid) }
+    private val stickyTrust = StickyWifiTrust(isTrusted)
 
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val isMonitoring = AtomicBoolean(false)
@@ -56,9 +63,9 @@ class WifiTrustMonitor(
         // Initial check
         refresh()
 
-        // Observe changes to the trusted network list
+        // Observe changes to the trusted networks
         observeJob = coroutineScope.launch {
-            trustedNetworkManager.trustedNetworks.collect {
+            trustChanges.collect {
                 evaluateTrust()
             }
         }
@@ -152,17 +159,13 @@ class WifiTrustMonitor(
 
     private fun evaluateTrust() {
         val info = _currentWifiInfo.value
-        val isTrusted = if (info != null && info.ssid != "<unknown ssid>") {
-            trustedNetworkManager.isTrusted(info.ssid)
-        } else {
-            false
-        }
+        val trusted = info != null && info.ssid != "<unknown ssid>" && isTrusted(info.ssid)
 
         val previous = _isNetworkTrusted.value
-        _isNetworkTrusted.value = isTrusted
+        _isNetworkTrusted.value = trusted
 
-        if (previous != isTrusted) {
-            Log.i(TAG, "Network trust state changed: $previous -> $isTrusted (SSID: ${info?.ssid})")
+        if (previous != trusted) {
+            Log.i(TAG, "Network trust state changed: $previous -> $trusted (SSID: ${info?.ssid})")
         }
     }
 

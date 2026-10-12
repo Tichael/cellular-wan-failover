@@ -21,6 +21,8 @@ import time
 import urllib.error
 import urllib.request
 
+import pairing
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -28,12 +30,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("wan-watchdog")
 
+USER_AGENT = "Cellular-WAN-Gateway/1.0"
+
+
+class PhoneAuthError(Exception):
+    """The phone rejected our signature, or its answer is not signed by the paired phone."""
+
+
+class PhoneRequestError(Exception):
+    """The phone answered (with a valid signature) but refused the request."""
+
+    def __init__(self, status: int, message: str | None):
+        super().__init__(f"HTTP {status}: {message or 'no details'}")
+        self.status = status
+
 
 class AndroidFailoverClient:
-    """HTTP client to communicate with the Android app local API (port 8989)."""
+    """
+    Signed HTTP client for the Android app's local API (port 8989), for one paired phone.
+    Each request is bound to a fresh single-use challenge from the phone, and each answer
+    must be signed by the phone for our nonce, so neither can be replayed (see PROTOCOL.md).
+    """
 
-    def __init__(self, phone_ip: str, http_port: int = 8989, timeout: float = 5.0):
+    def __init__(self, phone_ip: str, phone_id: str, key: bytes, gateway_id: str, http_port: int = 8989, timeout: float = 5.0):
         self.phone_ip = phone_ip
+        self.phone_id = phone_id
+        self.key = key
+        self.gateway_id = gateway_id
         self.http_port = http_port
         self.timeout = timeout
 
@@ -41,45 +64,83 @@ class AndroidFailoverClient:
     def base_url(self) -> str:
         return f"http://{self.phone_ip}:{self.http_port}"
 
-    def _request(self, path: str, method: str = "GET", data: bytes | None = None, timeout: float | None = None, attempts: int = 3) -> str:
-        url = f"{self.base_url}{path}"
-        headers = {"User-Agent": "Cellular-WAN-Gateway/1.0"}
-        if data:
-            headers["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    def _get_challenge(self, timeout: float) -> str:
+        req = urllib.request.Request(f"{self.base_url}/v1/challenge", headers={"User-Agent": USER_AGENT}, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            challenge = json.loads(resp.read().decode("utf-8")).get("challenge")
+        if not isinstance(challenge, str) or not challenge:
+            raise PhoneAuthError("Phone did not return a challenge")
+        return challenge
+
+    def _send_once(self, path: str, method: str, body: bytes, timeout: float) -> tuple[int, bytes, str | None, str]:
+        challenge = self._get_challenge(timeout)
+        nonce = pairing.new_id()
+        fields = pairing.request_fields(self.gateway_id, self.phone_id, method, path, challenge, nonce, body)
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Content-Type": "application/json",
+            pairing.HEADER_GATEWAY: self.gateway_id,
+            pairing.HEADER_PHONE: self.phone_id,
+            pairing.HEADER_CHALLENGE: challenge,
+            pairing.HEADER_NONCE: nonce,
+            pairing.HEADER_SIGNATURE: pairing.sign(self.key, fields),
+        }
+        req = urllib.request.Request(f"{self.base_url}{path}", data=body if method == "POST" else None, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.status, resp.read(), resp.headers.get(pairing.HEADER_SIGNATURE), nonce
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), e.headers.get(pairing.HEADER_SIGNATURE), nonce
+
+    def _request(self, path: str, method: str = "GET", body: bytes = b"", timeout: float | None = None, attempts: int = 3) -> dict:
         t = timeout or self.timeout
         for attempt in range(attempts):
             try:
-                with urllib.request.urlopen(req, timeout=t) as resp:
-                    return resp.read().decode("utf-8")
-            except (urllib.error.URLError, ConnectionError, OSError) as e:
+                status, raw, signature, nonce = self._send_once(path, method, body, t)
+                break
+            except (urllib.error.URLError, ConnectionError, OSError, ValueError):
                 if attempt == attempts - 1:
                     raise
                 time.sleep(0.5)
-        return ""
+
+        expected = pairing.response_fields(self.gateway_id, self.phone_id, nonce, status, raw)
+        if not pairing.verify(self.key, signature, expected):
+            if status == 401:
+                raise PhoneAuthError("Phone rejected our signature (pairing removed on the phone, or phone on another Wi-Fi?)")
+            raise PhoneAuthError(f"Answer to {path} is not signed by the paired phone (HTTP {status})")
+        data = json.loads(raw.decode("utf-8")) if raw else {}
+        if status >= 400:
+            raise PhoneRequestError(status, data.get("message") if isinstance(data, dict) else None)
+        return data
 
     def get_status(self) -> dict:
-        return json.loads(self._request("/v1/status"))
+        return self._request("/v1/status")
 
     def start_failover(self, gateway_public_key: str) -> dict:
         body = json.dumps({"gateway_public_key": gateway_public_key}).encode("utf-8")
-        return json.loads(self._request("/v1/failover/start", method="POST", data=body, timeout=15.0))
+        return self._request("/v1/failover/start", method="POST", body=body, timeout=15.0)
 
     def stop_failover(self, timeout: float = 10.0, attempts: int = 3) -> dict:
-        return json.loads(self._request("/v1/failover/stop", method="POST", data=b"", timeout=timeout, attempts=attempts))
+        return self._request("/v1/failover/stop", method="POST", body=b"{}", timeout=timeout, attempts=attempts)
+
+    def complete_pairing(self) -> dict:
+        return self._request("/v1/pair/complete", method="POST", body=b"{}", attempts=1)
 
 
 class PhoneDiscovery:
-    """Background UDP listener that keeps track of every smartphone broadcasting on the LAN."""
+    """
+    Background UDP listener that keeps track of every paired smartphone broadcasting on the LAN.
+    A broadcast only counts when it carries a valid signature for this gateway, made by a
+    paired phone for the address it is sent from.
+    """
 
-    def __init__(self, port: int = 8990, initial_ip: str | None = None, max_age: float = 15.0):
+    def __init__(self, gateway_id: str, key_for, port: int = 8990, max_age: float = 15.0):
+        self.gateway_id = gateway_id
+        # phone_id -> shared key, or None for an unknown phone
+        self.key_for = key_for
         self.port = port
-        self.static_ip = initial_ip
         # A phone is available while its broadcasts (every 5s) keep arriving
         self.max_age = max_age
-        # Most recently seen phone (used by the one-shot CLI actions)
-        self.phone_ip = initial_ip
-        self.device_info: dict[str, object] = {}
         self._phones: dict[str, dict[str, object]] = {}
         self._running = False
         self._thread: threading.Thread | None = None
@@ -93,30 +154,43 @@ class PhoneDiscovery:
     def stop(self):
         self._running = False
 
-    def get_phone_ip(self) -> str | None:
-        with self._lock:
-            return self.phone_ip
+    def handle_packet(self, ip: str, data: bytes, now: float | None = None) -> list[str]:
+        """Records the phones a broadcast from [ip] proves; returns their IDs."""
+        try:
+            payload = json.loads(data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return []
+        if not isinstance(payload, dict) or payload.get("service") != pairing.SERVICE_NAME:
+            return []
+        entries = payload.get("pairings")
+        if not isinstance(entries, list):
+            return []
+        proven = []
+        for entry in entries:
+            if not isinstance(entry, dict) or entry.get("gw") != self.gateway_id:
+                continue
+            phone_id = entry.get("pid")
+            key = self.key_for(phone_id) if isinstance(phone_id, str) else None
+            if key and pairing.verify(key, entry.get("sig"), pairing.discovery_fields(self.gateway_id, phone_id, ip)):
+                self.record_phone(phone_id, ip, now)
+                proven.append(phone_id)
+        return proven
 
-    def record_phone(self, ip: str, payload: dict, now: float | None = None):
+    def record_phone(self, phone_id: str, ip: str, now: float | None = None):
         now = time.monotonic() if now is None else now
         with self._lock:
-            previous = self._phones.get(ip)
-            if previous is None or now - previous["last_seen"] > self.max_age:
-                device_name = payload.get("device", "Android Device")
-                logger.info(f"[Discovery] Smartphone detected: {device_name} ({ip})")
-            self._phones[ip] = {"info": payload, "last_seen": now}
-            self.phone_ip = ip
-            self.device_info = payload
+            previous = self._phones.get(phone_id)
+            if previous is None or previous["ip"] != ip or now - previous["last_seen"] > self.max_age:
+                logger.info(f"[Discovery] Paired smartphone {phone_id} detected at {ip}")
+            self._phones[phone_id] = {"ip": ip, "last_seen": now}
 
-    def get_available_phones(self, now: float | None = None) -> list[str]:
-        """Phones heard within max_age, most recently seen first. A static PHONE_IP is always included."""
+    def get_available_phones(self, now: float | None = None) -> list[tuple[str, str]]:
+        """(phone_id, ip) of the phones heard within max_age, most recently seen first."""
         now = time.monotonic() if now is None else now
         with self._lock:
-            fresh = [ip for ip, p in self._phones.items() if now - p["last_seen"] <= self.max_age]
-            fresh.sort(key=lambda ip: self._phones[ip]["last_seen"], reverse=True)
-        if self.static_ip and self.static_ip not in fresh:
-            fresh.append(self.static_ip)
-        return fresh
+            fresh = [(pid, p) for pid, p in self._phones.items() if now - p["last_seen"] <= self.max_age]
+        fresh.sort(key=lambda item: item[1]["last_seen"], reverse=True)
+        return [(pid, p["ip"]) for pid, p in fresh]
 
     def _listen_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -134,25 +208,21 @@ class PhoneDiscovery:
             try:
                 ready = select.select([sock], [], [], 1.0)
                 if ready[0]:
-                    data, addr = sock.recvfrom(2048)
-                    try:
-                        payload = json.loads(data.decode("utf-8"))
-                        if payload.get("service") == "wan-failover" or "device" in payload:
-                            self.record_phone(addr[0], payload)
-                    except Exception as parse_err:
-                        logger.debug(f"[Discovery] Error parsing UDP packet from {addr}: {parse_err}")
-            except Exception:
-                pass
+                    data, addr = sock.recvfrom(4096)
+                    self.handle_packet(addr[0], data)
+            except Exception as e:
+                logger.debug(f"[Discovery] Error handling UDP packet: {e}")
         sock.close()
 
-    def wait_for_phone(self, timeout: float = 30.0) -> str:
-        start = time.time()
-        while time.time() - start < timeout:
-            ip = self.get_phone_ip()
-            if ip:
-                return ip
+    def wait_for_phone(self, timeout: float = 30.0, phone_id: str | None = None) -> tuple[str, str]:
+        """First available phone (or the given one): (phone_id, ip)."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            for pid, ip in self.get_available_phones():
+                if phone_id is None or pid == phone_id:
+                    return pid, ip
             time.sleep(0.5)
-        raise TimeoutError(f"No smartphone detected on UDP port {self.port} after {timeout}s")
+        raise TimeoutError(f"No paired smartphone detected on UDP port {self.port} after {timeout:.0f}s")
 
 
 class RoutingManager:
@@ -358,6 +428,7 @@ class FailoverCoordinator:
         self,
         discovery: "PhoneDiscovery",
         routing: "RoutingManager",
+        store: "pairing.PairingStore",
         http_port: int = 8989,
         wg_iface: str = "wg0",
         canary_ip: str = "198.18.0.1",
@@ -367,62 +438,85 @@ class FailoverCoordinator:
     ):
         self.discovery = discovery
         self.routing = routing
+        self.store = store
         self.http_port = http_port
         self.wg_iface = wg_iface
         self.canary_ip = canary_ip
         self.ping_timeout = ping_timeout
         self.tunnel_fail_threshold = tunnel_fail_threshold
         self.client_factory = client_factory or AndroidFailoverClient
-        self.active_phone_ip: str | None = None
+        # (phone_id, ip) of the phone carrying the failover
+        self.active_phone: tuple[str, str] | None = None
         self.tunnel_failures = 0
 
     @property
     def active(self) -> bool:
-        return self.active_phone_ip is not None
+        return self.active_phone is not None
 
-    def _client(self, ip: str) -> "AndroidFailoverClient":
-        return self.client_factory(phone_ip=ip, http_port=self.http_port)
+    @property
+    def active_phone_label(self) -> str | None:
+        return self.label(*self.active_phone) if self.active_phone else None
 
-    def _release_phone(self, ip: str):
+    def label(self, phone_id: str, ip: str) -> str:
+        phone = self.store.get(phone_id)
+        return f"{phone.label if phone else phone_id} ({ip})"
+
+    def client(self, phone_id: str, ip: str) -> "AndroidFailoverClient":
+        phone = self.store.get(phone_id)
+        if phone is None:
+            raise PhoneAuthError(f"Smartphone {phone_id} is no longer paired")
+        return self.client_factory(
+            phone_ip=ip, phone_id=phone_id, key=phone.key, gateway_id=self.discovery.gateway_id, http_port=self.http_port
+        )
+
+    def release_phone(self, phone_id: str, ip: str):
         """Best effort: the phone may be gone, so don't wait on it."""
         try:
-            res = self._client(ip).stop_failover(timeout=3.0, attempts=1)
-            logger.info(f"Smartphone {ip} returned to standby: {res}")
+            res = self.client(phone_id, ip).stop_failover(timeout=3.0, attempts=1)
+            logger.info(f"Smartphone {self.label(phone_id, ip)} returned to standby: {res}")
         except Exception as e:
-            logger.warning(f"Could not put smartphone {ip} back to standby: {e}")
+            logger.warning(f"Could not put smartphone {self.label(phone_id, ip)} back to standby: {e}")
 
     def _teardown_local(self):
         self.routing.disable_routing_and_nat()
         self.routing.teardown_wireguard_interface()
 
-    def activate(self, avoid: str | None = None) -> bool:
-        """Starts failover on the first available phone that succeeds. [avoid] (a phone just lost) is tried last."""
+    def activate(self, avoid: str | None = None, prefer: str | None = None) -> bool:
+        """
+        Starts failover on the first available phone that succeeds. [avoid] (a phone just lost)
+        is tried last, [prefer] first (phone IDs).
+        """
         candidates = self.discovery.get_available_phones()
-        if avoid in candidates:
-            candidates = [ip for ip in candidates if ip != avoid] + [avoid]
+        candidates.sort(key=lambda c: 0 if c[0] == prefer else 2 if c[0] == avoid else 1)
         if not candidates:
-            logger.error("Cannot activate failover: no smartphone available")
+            logger.error("Cannot activate failover: no paired smartphone available")
             return False
 
-        for ip in candidates:
+        for phone_id, ip in candidates:
+            label = self.label(phone_id, ip)
             try:
-                activate_failover(self._client(ip), self.routing)
-            except Exception as e:
-                logger.error(f"Failover activation via smartphone {ip} failed: {e}")
+                activate_failover(self.client(phone_id, ip), self.routing)
+            except PhoneRequestError as e:
+                # Refused before anything was set up here (e.g. 409: serving another gateway)
+                logger.error(f"Smartphone {label} refused failover: {e}")
                 self._teardown_local()
-                self._release_phone(ip)
                 continue
-            self.active_phone_ip = ip
+            except Exception as e:
+                logger.error(f"Failover activation via smartphone {label} failed: {e}")
+                self._teardown_local()
+                self.release_phone(phone_id, ip)
+                continue
+            self.active_phone = (phone_id, ip)
             self.tunnel_failures = 0
-            logger.info(f"Failover active via smartphone {ip}")
+            logger.info(f"Failover active via smartphone {label}")
             return True
         return False
 
     def deactivate(self):
         self._teardown_local()
-        if self.active_phone_ip:
-            self._release_phone(self.active_phone_ip)
-        self.active_phone_ip = None
+        if self.active_phone:
+            self.release_phone(*self.active_phone)
+        self.active_phone = None
         self.tunnel_failures = 0
 
     def tunnel_lost(self) -> bool:
@@ -435,17 +529,17 @@ class FailoverCoordinator:
             return False
         self.tunnel_failures += 1
         logger.warning(
-            f"Tunnel probe to smartphone {self.active_phone_ip} via {self.wg_iface} failed "
+            f"Tunnel probe to smartphone {self.active_phone_label} via {self.wg_iface} failed "
             f"({self.tunnel_failures}/{self.tunnel_fail_threshold})"
         )
         return self.tunnel_failures >= self.tunnel_fail_threshold
 
     def hand_over(self) -> bool:
         """Moves failover off the lost phone, preferring another one; retrying the same phone re-keys a restarted relay."""
-        lost = self.active_phone_ip
-        logger.error(f"!!! Smartphone {lost} lost: handing failover over to another smartphone... !!!")
+        lost_id = self.active_phone[0] if self.active_phone else None
+        logger.error(f"!!! Smartphone {self.active_phone_label} lost: handing failover over to another smartphone... !!!")
         self.deactivate()
-        return self.activate(avoid=lost)
+        return self.activate(avoid=lost_id)
 
 
 def check_tunnel_canary(iface: str, canary_ip: str = "198.18.0.1", timeout: int = 2) -> bool:
@@ -486,7 +580,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--wg-iface", default=os.environ.get("WG_IFACE", "wg0"), help="WireGuard interface name (default: wg0)")
     parser.add_argument("--table-id", type=int, default=int(os.environ.get("ROUTING_TABLE_ID", "100")), help="Policy routing table ID for failover traffic (default: 100)")
     parser.add_argument("--clamp-mss", action=argparse.BooleanOptionalAction, default=os.environ.get("CLAMP_MSS", "true").lower() in ("true", "1", "yes"), help="Enable/disable TCP MSS clamping for WireGuard (default: enabled)")
-    parser.add_argument("--phone-ip", default=os.environ.get("PHONE_IP"), help="Static Wi-Fi IP of smartphone (optional if using UDP discovery)")
+    parser.add_argument("--config-dir", default=os.environ.get("CONFIG_DIR", "/config"), help="Directory holding the gateway ID and paired phones (default: /config)")
+    parser.add_argument("--phone", help="Paired phone (name or ID) for --status-only / --start-now")
     parser.add_argument("--http-port", type=int, default=int(os.environ.get("HTTP_PORT", "8989")), help="Smartphone HTTP API port (default: 8989)")
     parser.add_argument("--discovery-port", type=int, default=int(os.environ.get("DISCOVERY_PORT", "8990")), help="UDP discovery port (default: 8990)")
     parser.add_argument("--targets", nargs="+", default=os.environ.get("PING_TARGETS", "1.1.1.1 8.8.8.8").split(), help="Ping target addresses")
@@ -501,6 +596,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-route", action="store_true", help="Test if current outbound traffic from primary interface is hairpinned through WAN 2")
     parser.add_argument("--start-now", action="store_true", help="Force immediate failover activation and exit")
     parser.add_argument("--stop-now", action="store_true", help="Force immediate failover teardown and exit")
+    parser.add_argument("--pair", action="store_true", help="Show a pairing QR code and wait for a smartphone to pair")
+    parser.add_argument("--pair-timeout", type=int, default=300, help="Seconds to wait for the smartphone during --pair (default: 300)")
+    parser.add_argument("--list-phones", action="store_true", help="List paired smartphones and whether they are online")
+    parser.add_argument("--unpair", metavar="PHONE", help="Remove a paired smartphone (name or ID)")
     return parser
 
 
@@ -508,10 +607,127 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return build_parser().parse_args(argv)
 
 
+def resolve_phone(store: "pairing.PairingStore", selector: str | None) -> "pairing.PairedPhone | None":
+    """The paired phone matching [selector] (exits with an error if none or ambiguous); None without selector."""
+    if not selector:
+        return None
+    matches = store.find(selector)
+    if len(matches) != 1:
+        problem = "No paired smartphone" if not matches else "Several paired smartphones"
+        print(f"Error: {problem} named '{selector}'. See 'wanctl phones'.", file=sys.stderr)
+        sys.exit(1)
+    return matches[0]
+
+
+def print_pairing_qr(link: str):
+    try:
+        # The link travels through stdin, not argv, so it never shows up in the process list
+        subprocess.run(["qrencode", "-t", "ANSIUTF8", "-m", "2"], input=link, text=True, check=True)
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        print(f"(Cannot draw the QR code: {e}; paste the link below instead)")
+
+
+def run_pairing(store: "pairing.PairingStore", args: argparse.Namespace) -> int:
+    """
+    Shows a one-time pairing QR code, then waits for the phone that scanned it: once it
+    broadcasts on its Wi-Fi with the new key, the gateway completes the pairing over HTTP.
+    That exchange proves to the phone that the gateway is on that Wi-Fi network. Nothing
+    is saved on either side before it succeeds.
+    """
+    gateway_id = store.gateway_id()
+    gateway_name = pairing.default_gateway_name()
+    phone_id, key = pairing.new_id(), pairing.new_key()
+    link = pairing.build_pair_link(gateway_id, gateway_name, phone_id, key)
+
+    print(f"Pairing a smartphone with gateway '{gateway_name}'.")
+    print("Connect the phone to the Wi-Fi network this gateway is on, then scan this QR code")
+    print("with the Cellular WAN Failover app or the camera app:\n")
+    print_pairing_qr(link)
+    print(f"\nOr paste this link in the app:\n{link}\n")
+    print(f"Waiting for the phone (up to {args.pair_timeout // 60} min, Ctrl+C to cancel)...", flush=True)
+
+    discovery = PhoneDiscovery(
+        gateway_id=gateway_id,
+        key_for=lambda pid: key if pid == phone_id else None,
+        port=args.discovery_port,
+    )
+    discovery.start()
+    deadline = time.monotonic() + args.pair_timeout
+    last_error = None
+    try:
+        while time.monotonic() < deadline:
+            try:
+                _, ip = discovery.wait_for_phone(timeout=max(deadline - time.monotonic(), 0.1), phone_id=phone_id)
+            except TimeoutError:
+                break
+            client = AndroidFailoverClient(phone_ip=ip, phone_id=phone_id, key=key, gateway_id=gateway_id, http_port=args.http_port)
+            try:
+                result = client.complete_pairing()
+                if not isinstance(result, dict):
+                    raise ValueError("unexpected answer to the pairing completion")
+            except Exception as e:
+                if str(e) != last_error:
+                    logger.warning(f"Completing the pairing with {ip} failed: {e} (retrying)")
+                    last_error = str(e)
+                time.sleep(3)
+                continue
+
+            name = pairing.sanitize_label(result.get("name")) or "Android phone"
+            ssid = pairing.sanitize_label(result.get("ssid"))
+            replaces = None
+            old = result.get("replaces")
+            if isinstance(old, dict) and isinstance(old.get("phone_id"), str):
+                previous = store.get(old["phone_id"])
+                # Only the phone holding the old key can retire its old pairing
+                if previous and pairing.verify(previous.key, old.get("sig"), pairing.replace_fields(gateway_id, previous.id, phone_id)):
+                    replaces = previous.id
+            store.add(pairing.PairedPhone(id=phone_id, name=name, key=key, ssid=ssid, paired_at=time.time()), replaces=replaces)
+            print(f"\n✓ Paired with '{name}'" + (f" on Wi-Fi '{ssid}'" if ssid else "") + (" (replaces its previous pairing)" if replaces else ""))
+            return 0
+    finally:
+        discovery.stop()
+
+    print("\nPairing timed out: the phone did not show up on this network. Nothing was saved.", file=sys.stderr)
+    return 1
+
+
+def list_phones(store: "pairing.PairingStore", discovery: "PhoneDiscovery"):
+    phones = store.phones()
+    if not phones:
+        print("No paired smartphones. Pair one with 'wanctl pair'.")
+        return
+    # Phones broadcast every 5s
+    time.sleep(6)
+    online = dict(discovery.get_available_phones())
+    print(f"{'NAME':<28} {'WI-FI':<20} {'PAIRED':<17} {'STATUS':<22} ID")
+    for p in phones:
+        paired = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.paired_at)) if p.paired_at else "?"
+        status = f"online ({online[p.id]})" if p.id in online else "not seen"
+        print(f"{p.label:<28} {p.ssid:<20} {paired:<17} {status:<22} {p.id}")
+
+
 def main():
     args = parse_args()
+    store = pairing.PairingStore(args.config_dir)
 
-    discovery = PhoneDiscovery(port=args.discovery_port, initial_ip=args.phone_ip)
+    if args.pair:
+        try:
+            sys.exit(run_pairing(store, args))
+        except KeyboardInterrupt:
+            print("\nPairing cancelled. Nothing was saved.")
+            sys.exit(130)
+
+    if args.unpair:
+        phone = resolve_phone(store, args.unpair)
+        store.remove(phone.id)
+        print(f"Removed '{phone.label}' ({phone.id}). Remove the gateway in the phone's app too.")
+        return
+
+    def key_for(phone_id: str) -> bytes | None:
+        phone = store.get(phone_id)
+        return phone.key if phone else None
+
+    discovery = PhoneDiscovery(gateway_id=store.gateway_id(), key_for=key_for, port=args.discovery_port)
     discovery.start()
 
     routing = RoutingManager(
@@ -524,6 +740,7 @@ def main():
     coordinator = FailoverCoordinator(
         discovery=discovery,
         routing=routing,
+        store=store,
         http_port=args.http_port,
         wg_iface=args.wg_iface,
         canary_ip=args.canary_ip,
@@ -531,29 +748,31 @@ def main():
         tunnel_fail_threshold=args.tunnel_fail_threshold,
     )
 
-    def get_client() -> AndroidFailoverClient:
-        ip = discovery.get_phone_ip()
-        if not ip:
-            logger.info("Waiting for smartphone discovery...")
-            ip = discovery.wait_for_phone(timeout=15.0)
-        return AndroidFailoverClient(phone_ip=ip, http_port=args.http_port)
+    selected = resolve_phone(store, args.phone)
+
+    def wait_for_phone() -> tuple[str, str]:
+        try:
+            return discovery.wait_for_phone(timeout=15.0, phone_id=selected.id if selected else None)
+        except TimeoutError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # CLI one-shot actions
+    if args.list_phones:
+        list_phones(store, discovery)
+        discovery.stop()
+        return
+
     if args.discover_only:
-        try:
-            ip = discovery.wait_for_phone(timeout=30.0)
-            print(f"Smartphone discovered: IP={ip}, Info={discovery.device_info}")
-        except TimeoutError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-        finally:
-            discovery.stop()
+        phone_id, ip = wait_for_phone()
+        print(f"Smartphone discovered: {coordinator.label(phone_id, ip)}")
+        discovery.stop()
         return
 
     if args.status_only:
-        client = get_client()
-        print(f"Connecting to {client.base_url}...")
-        status = client.get_status()
+        phone_id, ip = wait_for_phone()
+        print(f"Querying {coordinator.label(phone_id, ip)}...")
+        status = coordinator.client(phone_id, ip).get_status()
         print(json.dumps(status, indent=2))
         discovery.stop()
         return
@@ -578,8 +797,8 @@ def main():
         return
 
     if args.start_now:
-        get_client()  # waits for a first smartphone
-        activated = coordinator.activate()
+        wait_for_phone()  # waits for a first smartphone
+        activated = coordinator.activate(prefer=selected.id if selected else None)
         discovery.stop()
         if not activated:
             sys.exit(1)
@@ -587,14 +806,14 @@ def main():
         return
 
     if args.stop_now:
-        get_client()  # waits for a first smartphone
+        wait_for_phone()  # waits for a first smartphone
         # Listen one more broadcast interval so every phone (only one carries the failover) is known
         time.sleep(6)
         routing.disable_routing_and_nat()
         routing.teardown_wireguard_interface()
-        for ip in discovery.get_available_phones():
-            logger.info(f"Manual deactivation on {ip}...")
-            coordinator._release_phone(ip)
+        for phone_id, ip in discovery.get_available_phones():
+            logger.info(f"Manual deactivation on {coordinator.label(phone_id, ip)}...")
+            coordinator.release_phone(phone_id, ip)
         logger.info("Cellular failover stopped.")
         discovery.stop()
         return
@@ -626,16 +845,16 @@ def main():
     logger.info(f"  - Fail / restore thresholds  : {args.fail_threshold} failures / {args.restore_threshold} successes")
     logger.info(f"  - Lost phone after           : {args.tunnel_fail_threshold} failed tunnel probes")
     logger.info(f"  - Health check interval      : {args.check_interval}s")
+    logger.info(f"  - Paired smartphones         : {', '.join(p.label for p in store.phones()) or 'none (run wanctl pair)'}")
     logger.info("====================================================================")
 
     # Smartphone check at startup
-    if not args.phone_ip:
-        logger.info("Initial discovery for smartphone on local Wi-Fi...")
-        try:
-            detected_ip = discovery.wait_for_phone(timeout=10.0)
-            logger.info(f"Smartphone ready: {detected_ip}")
-        except TimeoutError:
-            logger.warning("Smartphone not detected yet (discovery continues in background)")
+    logger.info("Initial discovery for paired smartphones on local Wi-Fi...")
+    try:
+        phone_id, ip = discovery.wait_for_phone(timeout=10.0)
+        logger.info(f"Smartphone ready: {coordinator.label(phone_id, ip)}")
+    except TimeoutError:
+        logger.warning("No paired smartphone detected yet (discovery continues in background)")
 
     try:
         while running:
@@ -648,7 +867,7 @@ def main():
                         coordinator.deactivate()
                         failed_probes = 0
                     elif coordinator.hand_over():
-                        logger.info(f">>> Failover handed over to smartphone {coordinator.active_phone_ip}. <<<")
+                        logger.info(f">>> Failover handed over to smartphone {coordinator.active_phone_label}. <<<")
                     else:
                         # Still in an outage: retry activation on the next failed WAN 1 probe
                         logger.error("No smartphone could take over the failover; retrying on next probe")

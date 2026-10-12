@@ -13,3 +13,8 @@ services:
         required: false
     volumes:
       - /lib/modules:/lib/modules:ro
+      # Gateway ID and paired phones: survives image updates
+      - gateway-config:/config
+
+volumes:
+  gateway-config:

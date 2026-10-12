@@ -41,6 +41,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -66,10 +67,17 @@ import com.example.cellularwanfailover.controller.FailoverController
 import com.example.cellularwanfailover.model.CellularState
 import com.example.cellularwanfailover.model.FailoverState
 import com.example.cellularwanfailover.model.LogEntry
-import com.example.cellularwanfailover.model.TrustedNetwork
+import com.example.cellularwanfailover.auth.GatewayPairing
+import com.example.cellularwanfailover.auth.PairingInvite
+import com.example.cellularwanfailover.auth.PairingState
 import com.example.cellularwanfailover.model.WifiNetworkInfo
 import com.example.cellularwanfailover.service.FailoverForegroundService
+import com.google.mlkit.vision.barcode.common.Barcode
+import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
+import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import kotlinx.coroutines.launch
+import java.text.DateFormat
+import java.util.Date
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -127,7 +135,8 @@ fun MainScreen(
     val logs by controller.logs.collectAsStateWithLifecycle()
     val isNetworkTrusted by controller.isNetworkTrusted.collectAsStateWithLifecycle()
     val currentWifiNetwork by controller.currentWifiNetwork.collectAsStateWithLifecycle()
-    val trustedNetworks by controller.trustedNetworks.collectAsStateWithLifecycle()
+    val pairings by controller.pairings.collectAsStateWithLifecycle()
+    val pairingState by controller.pairingState.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -195,14 +204,16 @@ fun MainScreen(
                 wireguardPublicKey = controller.wireguardPublicKey
             )
 
-            // Trusted Networks Card
-            TrustedNetworksCard(
+            // Paired Gateways Card (each pairing trusts the Wi-Fi network it was made on)
+            GatewaysCard(
                 isNetworkTrusted = isNetworkTrusted,
                 currentWifi = currentWifiNetwork,
-                trustedNetworks = trustedNetworks,
-                onAddCurrentNetwork = { controller.addCurrentNetwork() },
-                onRemoveNetwork = { id -> controller.removeTrustedNetwork(id) },
-                onClearAll = { controller.clearTrustedNetworks() },
+                pairings = pairings,
+                pairingState = pairingState,
+                onPairingLink = { link -> PairingActivity.start(context, link) },
+                onCancelPairing = { controller.cancelPairing() },
+                onDismissPairingResult = { controller.acknowledgePairingResult() },
+                onRemoveGateway = { gatewayId -> controller.removeGateway(gatewayId) },
                 onRequestLocationPermission = {
                     permissionsLauncher.launch(
                         arrayOf(
@@ -263,7 +274,7 @@ fun HeaderView(
         }
 
         val (badgeColor, badgeText) = if (!isNetworkTrusted) {
-            Color(0xFFE65100) to "PAUSED (UNTRUSTED)"
+            Color(0xFFE65100) to "PAUSED (NOT PAIRED)"
         } else {
             when (failoverState) {
                 FailoverState.IDLE -> Color(0xFF689F38) to "STANDBY"
@@ -408,19 +419,32 @@ fun StatusCard(
 }
 
 @Composable
-fun TrustedNetworksCard(
+fun GatewaysCard(
     isNetworkTrusted: Boolean,
     currentWifi: WifiNetworkInfo?,
-    trustedNetworks: List<TrustedNetwork>,
-    onAddCurrentNetwork: () -> Unit,
-    onRemoveNetwork: (String) -> Unit,
-    onClearAll: () -> Unit,
+    pairings: List<GatewayPairing>,
+    pairingState: PairingState,
+    onPairingLink: (String) -> Unit,
+    onCancelPairing: () -> Unit,
+    onDismissPairingResult: () -> Unit,
+    onRemoveGateway: (String) -> Unit,
     onRequestLocationPermission: () -> Unit,
     showBackgroundLocationWarning: Boolean,
     onRequestBackgroundLocation: () -> Unit
 ) {
-    var showClearConfirmDialog by remember { mutableStateOf(false) }
+    val context = LocalContext.current
     var showBackgroundLocationDialog by remember { mutableStateOf(false) }
+    var showPasteDialog by remember { mutableStateOf(false) }
+    var invalidCodeMessage by remember { mutableStateOf<String?>(null) }
+    var gatewayToRemove by remember { mutableStateOf<GatewayPairing?>(null) }
+
+    fun openLink(text: String) {
+        if (PairingInvite.parse(text) != null) {
+            onPairingLink(text.trim())
+        } else {
+            invalidCodeMessage = "This isn't a gateway pairing code. On the gateway, run 'wanctl pair' and scan its QR code."
+        }
+    }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -434,14 +458,14 @@ fun TrustedNetworksCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
-                    text = "Trusted Wi-Fi Whitelist",
+                    text = "Paired Gateways",
                     fontWeight = FontWeight.SemiBold,
                     fontSize = 15.sp
                 )
                 val (badgeBg, badgeFg, badgeLabel) = when {
                     currentWifi == null -> Triple(Color(0xFFE0E0E0), Color(0xFF616161), "NO WI-FI")
-                    isNetworkTrusted -> Triple(Color(0xFFE8F5E9), Color(0xFF2E7D32), "TRUSTED")
-                    else -> Triple(Color(0xFFFFEBEE), Color(0xFFC62828), "UNTRUSTED")
+                    isNetworkTrusted -> Triple(Color(0xFFE8F5E9), Color(0xFF2E7D32), "PAIRED HERE")
+                    else -> Triple(Color(0xFFFFEBEE), Color(0xFFC62828), "NOT PAIRED HERE")
                 }
                 Box(
                     modifier = Modifier
@@ -467,8 +491,7 @@ fun TrustedNetworksCard(
             ) {
                 Text(text = "Current Network:", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (currentSsid == "<unknown ssid>") {
-                    val context = LocalContext.current
-                    val isPermissionGranted = androidx.core.content.ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == android.content.pm.PackageManager.PERMISSION_GRANTED
+                    val isPermissionGranted = hasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
                     TextButton(onClick = {
                         if (isPermissionGranted) {
                             context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
@@ -516,45 +539,53 @@ fun TrustedNetworksCard(
 
             HorizontalDivider()
 
-            // Buttons: Add Current Network & Clear All
-            val canAddCurrent = currentWifi != null &&
-                    currentSsid != null &&
-                    currentSsid != "<unknown ssid>" &&
-                    trustedNetworks.none { it.ssid.equals(currentSsid, ignoreCase = false) }
-
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Button(
-                    onClick = onAddCurrentNetwork,
-                    modifier = Modifier.weight(1f),
-                    enabled = canAddCurrent
+                    onClick = {
+                        scanPairingQr(
+                            context = context,
+                            onResult = { openLink(it) },
+                            onError = { invalidCodeMessage = it }
+                        )
+                    },
+                    modifier = Modifier.weight(1f)
                 ) {
-                    val addText = when {
-                        currentWifi == null -> "No Wi-Fi"
-                        currentSsid == "<unknown ssid>" -> "Location Needed"
-                        !canAddCurrent -> "Already Added"
-                        else -> "Add Current Network"
-                    }
-                    Text(addText, fontSize = 12.sp)
+                    Text("Scan Gateway QR", fontSize = 12.sp)
                 }
 
-                OutlinedButton(
-                    onClick = { showClearConfirmDialog = true },
-                    enabled = trustedNetworks.isNotEmpty(),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        contentColor = MaterialTheme.colorScheme.error
-                    )
-                ) {
-                    Text("Clear All", fontSize = 12.sp)
+                OutlinedButton(onClick = { showPasteDialog = true }) {
+                    Text("Paste Link", fontSize = 12.sp)
                 }
             }
 
-            // List of trusted networks
-            if (trustedNetworks.isEmpty()) {
+            // Pairing in progress (or its outcome) when its screen was left
+            when (pairingState) {
+                is PairingState.Waiting -> PairingStatusRow(
+                    text = "Pairing with ${pairingState.gatewayName} on Wi-Fi '${pairingState.ssid}': waiting for the gateway...",
+                    color = Color(0xFF1565C0),
+                    action = "Cancel" to onCancelPairing,
+                    showProgress = true
+                )
+                is PairingState.Failed -> PairingStatusRow(
+                    text = "Pairing with ${pairingState.gatewayName} failed: ${pairingState.reason}",
+                    color = MaterialTheme.colorScheme.error,
+                    action = "Dismiss" to onDismissPairingResult
+                )
+                is PairingState.Paired -> PairingStatusRow(
+                    text = "Paired with ${pairingState.gatewayName} on Wi-Fi '${pairingState.ssid}'.",
+                    color = Color(0xFF2E7D32),
+                    action = "OK" to onDismissPairingResult
+                )
+                PairingState.Idle -> Unit
+            }
+
+            if (pairings.isEmpty()) {
                 Text(
-                    text = "No trusted networks added yet. Gateway services remain halted until an approved Wi-Fi network is added.",
+                    text = "No gateway paired yet. On the gateway, run 'docker exec -it wan-failover-gateway wanctl pair' " +
+                        "and scan the QR code while this phone is on the same Wi-Fi network.",
                     color = Color.Gray,
                     fontSize = 12.sp,
                     modifier = Modifier.padding(vertical = 4.dp)
@@ -563,11 +594,12 @@ fun TrustedNetworksCard(
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 140.dp)
+                        .heightIn(max = 160.dp)
                         .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(4.dp)
                 ) {
-                    trustedNetworks.forEach { network ->
+                    pairings.forEach { pairing ->
+                        val onThisWifi = pairing.ssid == currentSsid
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -579,22 +611,23 @@ fun TrustedNetworksCard(
                         ) {
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    text = network.ssid,
+                                    text = pairing.gatewayName,
                                     fontWeight = FontWeight.SemiBold,
                                     fontSize = 13.sp
                                 )
-                                if (network.bssid != null) {
-                                    Text(
-                                        text = "BSSID: ${network.bssid}",
-                                        fontSize = 10.sp,
-                                        color = Color.Gray,
-                                        fontFamily = FontFamily.Monospace
-                                    )
-                                }
+                                Text(
+                                    text = "Wi-Fi: ${pairing.ssid}" + if (onThisWifi) " (connected)" else "",
+                                    fontSize = 11.sp,
+                                    color = if (onThisWifi) Color(0xFF2E7D32) else Color.Gray
+                                )
+                                Text(
+                                    text = "Paired " + DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
+                                        .format(Date(pairing.pairedAt)),
+                                    fontSize = 10.sp,
+                                    color = Color.Gray
+                                )
                             }
-                            TextButton(
-                                onClick = { onRemoveNetwork(network.id) }
-                            ) {
+                            TextButton(onClick = { gatewayToRemove = pairing }) {
                                 Text("Remove", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
                             }
                         }
@@ -610,7 +643,7 @@ fun TrustedNetworksCard(
             title = { Text("Allow location all the time") },
             text = {
                 Text(
-                    "To confirm you're on a trusted Wi-Fi network while the phone is locked or the app is " +
+                    "To confirm you're on a paired Wi-Fi network while the phone is locked or the app is " +
                         "closed, Android requires location access set to \"Allow all the time\".\n\n" +
                         "The app only reads the Wi-Fi name. It doesn't use or store your location.\n\n" +
                         "On the next screen, choose \"Allow all the time\".",
@@ -633,30 +666,116 @@ fun TrustedNetworksCard(
         )
     }
 
-    if (showClearConfirmDialog) {
+    if (showPasteDialog) {
+        var input by remember { mutableStateOf("") }
         AlertDialog(
-            onDismissRequest = { showClearConfirmDialog = false },
-            title = { Text("Clear All Trusted Networks?") },
+            onDismissRequest = { showPasteDialog = false },
+            title = { Text("Paste Pairing Link") },
             text = {
-                Text("This will remove all approved networks. Gateway services will immediately halt until a network is added.")
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("Paste the link printed by 'wanctl pair' on the gateway:", fontSize = 13.sp)
+                    OutlinedTextField(
+                        value = input,
+                        onValueChange = { input = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("wanfailover://pair?...") },
+                        maxLines = 4
+                    )
+                }
             },
             confirmButton = {
                 Button(
                     onClick = {
-                        onClearAll()
-                        showClearConfirmDialog = false
+                        showPasteDialog = false
+                        openLink(input)
                     },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                    enabled = input.isNotBlank()
                 ) {
-                    Text("Clear All")
+                    Text("Continue")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showClearConfirmDialog = false }) {
+                TextButton(onClick = { showPasteDialog = false }) {
                     Text("Cancel")
                 }
             }
         )
+    }
+
+    invalidCodeMessage?.let { message ->
+        AlertDialog(
+            onDismissRequest = { invalidCodeMessage = null },
+            title = { Text("Can't pair") },
+            text = { Text(message, fontSize = 13.sp) },
+            confirmButton = {
+                TextButton(onClick = { invalidCodeMessage = null }) { Text("OK") }
+            }
+        )
+    }
+
+    gatewayToRemove?.let { pairing ->
+        AlertDialog(
+            onDismissRequest = { gatewayToRemove = null },
+            title = { Text("Remove ${pairing.gatewayName}?") },
+            text = {
+                Text(
+                    "This gateway won't be able to use the phone anymore, and Wi-Fi '${pairing.ssid}' is no longer " +
+                        "trusted unless another gateway is paired on it. Also run 'wanctl unpair' on the gateway.",
+                    fontSize = 13.sp
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        onRemoveGateway(pairing.gatewayId)
+                        gatewayToRemove = null
+                    },
+                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
+                ) {
+                    Text("Remove")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { gatewayToRemove = null }) { Text("Cancel") }
+            }
+        )
+    }
+}
+
+@Composable
+private fun PairingStatusRow(text: String, color: Color, action: Pair<String, () -> Unit>, showProgress: Boolean = false) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(color.copy(alpha = 0.08f))
+            .padding(horizontal = 10.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (showProgress) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = color)
+        Text(text = text, fontSize = 12.sp, color = color, modifier = Modifier.weight(1f))
+        TextButton(onClick = action.second) { Text(action.first, fontSize = 12.sp) }
+    }
+}
+
+/** Google Code Scanner: Play services shows the camera UI, so the app needs no camera permission. */
+private fun scanPairingQr(context: Context, onResult: (String) -> Unit, onError: (String) -> Unit) {
+    try {
+        val options = GmsBarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .enableAutoZoom()
+            .build()
+        GmsBarcodeScanning.getClient(context, options)
+            .startScan()
+            .addOnSuccessListener { barcode ->
+                val raw = barcode.rawValue
+                if (raw.isNullOrBlank()) onError("The scanned QR code is empty.") else onResult(raw)
+            }
+            .addOnFailureListener { e -> onError("Couldn't scan: ${e.message ?: "scanner unavailable"}") }
+        // Closing the scanner (back) is a cancel: nothing to report
+    } catch (e: Exception) {
+        onError("Google Code Scanner is unavailable: ${e.message}. Use 'Paste Link' instead.")
     }
 }
 

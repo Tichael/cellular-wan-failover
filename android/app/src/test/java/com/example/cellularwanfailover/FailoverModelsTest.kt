@@ -1,6 +1,6 @@
 package com.example.cellularwanfailover
 
-import com.example.cellularwanfailover.model.DiscoveryMessage
+import com.example.cellularwanfailover.model.ChallengeResponse
 import com.example.cellularwanfailover.model.FailoverActionResponse
 import com.example.cellularwanfailover.model.StatusResponse
 import kotlinx.serialization.encodeToString
@@ -60,16 +60,8 @@ class FailoverModelsTest {
     }
 
     @Test
-    fun testDiscoveryMessageSerialization() {
-        val msg = DiscoveryMessage(
-            device = "Pixel 8",
-            service = "wan-failover",
-            port = 8989
-        )
-        val encoded = json.encodeToString(msg)
-        val decoded = json.decodeFromString<DiscoveryMessage>(encoded)
-        assertEquals("Pixel 8", decoded.device)
-        assertEquals("wan-failover", decoded.service)
-        assertEquals(8989, decoded.port)
+    fun testChallengeResponseSerialization() {
+        val decoded = json.decodeFromString<ChallengeResponse>("""{"challenge":"Y2hhbGxlbmdlLTAwMDAwMQ"}""")
+        assertEquals("Y2hhbGxlbmdlLTAwMDAwMQ", decoded.challenge)
     }
 }
