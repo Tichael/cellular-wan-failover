@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -48,6 +49,70 @@ func IsRunning() bool {
 
 func GetBytesTransmitted() int64 {
 	return int64(totalBytesTransmitted.Load())
+}
+
+// SetCellularNetwork switches the relay's outbound connections to another cellular network
+// (handover, new carrier session...) without restarting WireGuard. Connections opened on the
+// previous network end with it; new ones use [netHandle]. 0 means no cellular network: new
+// connections are refused until one is set.
+func SetCellularNetwork(netHandle uint64) bool {
+	relayMutex.Lock()
+	defer relayMutex.Unlock()
+	if !isRunningState.Load() {
+		return false
+	}
+	if currentNetHandle.Swap(netHandle) != netHandle {
+		androidLog(fmt.Sprintf("Cellular network switched to netHandle=%d", netHandle))
+	}
+	return true
+}
+
+// LastHandshakeUnix is the time (Unix seconds) of the gateway's last WireGuard handshake,
+// 0 if there has been none (or the relay is stopped).
+func LastHandshakeUnix() int64 {
+	relayMutex.Lock()
+	dev := currentDevice
+	relayMutex.Unlock()
+	if dev == nil {
+		return 0
+	}
+	state, err := dev.IpcGet()
+	if err != nil {
+		return 0
+	}
+	return parseLastHandshake(state)
+}
+
+func parseLastHandshake(uapiState string) int64 {
+	var latest int64
+	for _, line := range strings.Split(uapiState, "\n") {
+		value, found := strings.CutPrefix(line, "last_handshake_time_sec=")
+		if !found {
+			continue
+		}
+		if secs, err := strconv.ParseInt(value, 10, 64); err == nil && secs > latest {
+			latest = secs
+		}
+	}
+	return latest
+}
+
+var errNoCellular = errors.New("no cellular network")
+
+// dialCellular opens an outbound connection on the current cellular network only: without
+// one, it fails rather than leaving through the default network (Wi-Fi, i.e. back into the LAN).
+func dialCellular(network, destAddr string) (net.Conn, error) {
+	netHandle := currentNetHandle.Load()
+	if netHandle == 0 {
+		return nil, errNoCellular
+	}
+	dialer := &net.Dialer{
+		Timeout: 10 * time.Second,
+		Control: func(_, _ string, c syscall.RawConn) error {
+			return bindFdToNetwork(c, netHandle)
+		},
+	}
+	return dialer.Dial(network, destAddr)
 }
 
 func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifiNetHandle, netHandle uint64) error {
@@ -138,7 +203,7 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifi
 		r.Complete(false)
 
 		clientConn := gonet.NewTCPConn(&wq, clientEP)
-		go handleTCPProxy(clientConn, destAddr, netHandle)
+		go handleTCPProxy(clientConn, destAddr)
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, fwdTCP.HandlePacket)
 
@@ -162,7 +227,7 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifi
 		}
 
 		clientConn := gonet.NewUDPConn(&wq, clientEP)
-		go handleUDPProxy(clientConn, destAddr, netHandle)
+		go handleUDPProxy(clientConn, destAddr)
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, fwdUDP.HandlePacket)
 
@@ -204,17 +269,10 @@ func StartRelay(port int, privKeyBase64, peerPubKeyBase64, bindAddr string, wifi
 	return nil
 }
 
-func handleTCPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
+func handleTCPProxy(clientConn net.Conn, destAddr string) {
 	defer clientConn.Close()
 
-	dialer := &net.Dialer{
-		Timeout: 10 * time.Second,
-		Control: func(network, address string, c syscall.RawConn) error {
-			return bindFdToNetwork(c, netHandle)
-		},
-	}
-
-	remoteConn, err := dialer.Dial("tcp", destAddr)
+	remoteConn, err := dialCellular("tcp", destAddr)
 	if err != nil {
 		return
 	}
@@ -241,17 +299,10 @@ func handleTCPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
 	wg.Wait()
 }
 
-func handleUDPProxy(clientConn net.Conn, destAddr string, netHandle uint64) {
+func handleUDPProxy(clientConn net.Conn, destAddr string) {
 	defer clientConn.Close()
 
-	dialer := &net.Dialer{
-		Timeout: 10 * time.Second,
-		Control: func(network, address string, c syscall.RawConn) error {
-			return bindFdToNetwork(c, netHandle)
-		},
-	}
-
-	remoteConn, err := dialer.Dial("udp", destAddr)
+	remoteConn, err := dialCellular("udp", destAddr)
 	if err != nil {
 		return
 	}

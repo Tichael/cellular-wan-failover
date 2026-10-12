@@ -154,6 +154,24 @@ class FailoverController private constructor(
                 _cellularState.value = state
             }
         }
+
+        // While the relay runs, Android may replace the cellular network (handover, carrier
+        // session reset, airplane mode...): the request stays filed, so follow the new one
+        scope.launch {
+            var previous: Long? = null
+            cellularManager.cellularNetwork.collect { network ->
+                val handle = network?.networkHandle ?: 0L
+                if (wireGuardManager.isRunning && previous != null && handle != previous) {
+                    if (network == null) {
+                        logEvent("FailoverController", "Cellular network lost: waiting for Android to bring it back...", true)
+                    } else {
+                        logEvent("FailoverController", "Relay switched to cellular network $network")
+                    }
+                }
+                wireGuardManager.setCellularNetwork(handle)
+                previous = handle
+            }
+        }
     }
 
     private var isServiceRunning = false
@@ -405,6 +423,11 @@ class FailoverController private constructor(
         logEvent("FailoverController", "WireGuard relay stopped, mobile cellular radio released")
     }
 
+    private fun activeGatewayName(): String {
+        val id = activeGatewayId ?: return "?"
+        return pairings.value.firstOrNull { it.gatewayId == id }?.let { "'${it.gatewayName}'" } ?: id
+    }
+
     fun refreshWifiIp() {
         val ip = NetworkUtils.getWifiIpAddress(appContext)
         _wifiIp.value = ip
@@ -440,6 +463,15 @@ class FailoverController private constructor(
                 ensureHttpServer()
                 wireGuardManager.updateStatistics()
                 _bytesTransmitted.value = wireGuardManager.bytesTransmitted.get()
+                if (_failoverState.value == FailoverState.ACTIVE && wireGuardManager.isOrphaned()) {
+                    logEvent(
+                        "FailoverController",
+                        "Gateway ${activeGatewayName()} has not renewed the tunnel for " +
+                            "${WireGuardManager.ORPHAN_TIMEOUT_SECONDS / 60} min: releasing the relay",
+                        true
+                    )
+                    stopFailover()
+                }
                 delay(2000L)
             }
         }
