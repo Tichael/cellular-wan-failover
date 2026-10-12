@@ -8,6 +8,7 @@ import android.net.NetworkRequest
 import android.net.wifi.WifiInfo
 import android.os.Build
 import android.util.Log
+import androidx.annotation.RequiresApi
 import com.example.cellularwanfailover.model.WifiNetworkInfo
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -67,23 +68,12 @@ class WifiTrustMonitor(
             .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
             .build()
 
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                Log.d(TAG, "Wi-Fi network available: $network")
-                val caps = connectivityManager.getNetworkCapabilities(network)
-                updateFromCapabilities(network, caps)
-            }
-
-            override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
-                updateFromCapabilities(network, networkCapabilities)
-            }
-
-            override fun onLost(network: Network) {
-                Log.d(TAG, "Wi-Fi network lost: $network")
-                stickyTrust.onNetworkLost(network.networkHandle)
-                // Check if any other Wi-Fi network is still connected
-                refresh()
-            }
+        // Android 12+ hides the SSID in callbacks unless location info is explicitly requested
+        // (still subject to the location permission, "Allow all the time" in the background)
+        val callback = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            WifiCallback(ConnectivityManager.NetworkCallback.FLAG_INCLUDE_LOCATION_INFO)
+        } else {
+            WifiCallback()
         }
 
         networkCallback = callback
@@ -173,6 +163,30 @@ class WifiTrustMonitor(
 
         if (previous != isTrusted) {
             Log.i(TAG, "Network trust state changed: $previous -> $isTrusted (SSID: ${info?.ssid})")
+        }
+    }
+
+    private inner class WifiCallback : ConnectivityManager.NetworkCallback {
+        constructor() : super()
+
+        @RequiresApi(Build.VERSION_CODES.S)
+        constructor(flags: Int) : super(flags)
+
+        override fun onAvailable(network: Network) {
+            Log.d(TAG, "Wi-Fi network available: $network")
+            val caps = connectivityManager.getNetworkCapabilities(network)
+            updateFromCapabilities(network, caps)
+        }
+
+        override fun onCapabilitiesChanged(network: Network, networkCapabilities: NetworkCapabilities) {
+            updateFromCapabilities(network, networkCapabilities)
+        }
+
+        override fun onLost(network: Network) {
+            Log.d(TAG, "Wi-Fi network lost: $network")
+            stickyTrust.onNetworkLost(network.networkHandle)
+            // Check if any other Wi-Fi network is still connected
+            refresh()
         }
     }
 }

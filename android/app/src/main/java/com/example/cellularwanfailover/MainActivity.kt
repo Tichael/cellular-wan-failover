@@ -60,6 +60,7 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.cellularwanfailover.controller.FailoverController
 import com.example.cellularwanfailover.model.CellularState
@@ -138,6 +139,23 @@ fun MainScreen(
         controller.refreshWifiNetworkInfo()
     }
 
+    // "Allow all the time": lets the app read the Wi-Fi name while locked / in the background,
+    // so it can verify a trusted network (e.g. after coming home) without being opened
+    var hasForegroundLocation by remember { mutableStateOf(hasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)) }
+    var hasBackgroundLocation by remember { mutableStateOf(hasBackgroundLocationPermission(context)) }
+    val backgroundLocationLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        hasBackgroundLocation = granted
+        controller.refreshWifiNetworkInfo()
+    }
+    // Re-check when returning from the system permission screen
+    LifecycleResumeEffect(Unit) {
+        hasForegroundLocation = hasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
+        hasBackgroundLocation = hasBackgroundLocationPermission(context)
+        onPauseOrDispose { }
+    }
+
     LaunchedEffect(Unit) {
         val perms = mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
@@ -192,6 +210,11 @@ fun MainScreen(
                             Manifest.permission.ACCESS_COARSE_LOCATION
                         )
                     )
+                },
+                showBackgroundLocationWarning = hasForegroundLocation && !hasBackgroundLocation,
+                onRequestBackgroundLocation = {
+                    // Android 11+ opens the app's location settings, where "Allow all the time" is chosen
+                    backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
                 }
             )
 
@@ -392,9 +415,12 @@ fun TrustedNetworksCard(
     onAddCurrentNetwork: () -> Unit,
     onRemoveNetwork: (String) -> Unit,
     onClearAll: () -> Unit,
-    onRequestLocationPermission: () -> Unit
+    onRequestLocationPermission: () -> Unit,
+    showBackgroundLocationWarning: Boolean,
+    onRequestBackgroundLocation: () -> Unit
 ) {
     var showClearConfirmDialog by remember { mutableStateOf(false) }
+    var showBackgroundLocationDialog by remember { mutableStateOf(false) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -458,6 +484,33 @@ fun TrustedNetworksCard(
                         fontWeight = FontWeight.Medium,
                         fontSize = 13.sp
                     )
+                }
+            }
+
+            if (showBackgroundLocationWarning) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(Color(0xFFFFF8E1))
+                        .padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "Background Wi-Fi check is off",
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 13.sp,
+                        color = Color(0xFF8D6E00)
+                    )
+                    Text(
+                        text = "Android only shows the Wi-Fi name while the app is open. When the phone " +
+                            "reconnects to Wi-Fi while locked, failover stays paused until you open the app.",
+                        fontSize = 12.sp,
+                        color = Color(0xFF5D4600)
+                    )
+                    TextButton(onClick = { showBackgroundLocationDialog = true }) {
+                        Text("Allow all the time", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
+                    }
                 }
             }
 
@@ -549,6 +602,35 @@ fun TrustedNetworksCard(
                 }
             }
         }
+    }
+
+    if (showBackgroundLocationDialog) {
+        AlertDialog(
+            onDismissRequest = { showBackgroundLocationDialog = false },
+            title = { Text("Allow location all the time") },
+            text = {
+                Text(
+                    "To confirm you're on a trusted Wi-Fi network while the phone is locked or the app is " +
+                        "closed, Android requires location access set to \"Allow all the time\".\n\n" +
+                        "The app only reads the Wi-Fi name. It doesn't use or store your location.\n\n" +
+                        "On the next screen, choose \"Allow all the time\".",
+                    fontSize = 13.sp
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showBackgroundLocationDialog = false
+                    onRequestBackgroundLocation()
+                }) {
+                    Text("Continue")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBackgroundLocationDialog = false }) {
+                    Text("Not now")
+                }
+            }
+        )
     }
 
     if (showClearConfirmDialog) {
@@ -735,3 +817,12 @@ private fun formatBytes(bytes: Long): String {
     val pre = "KMGTPE"[exp - 1]
     return String.format(Locale.US, "%.2f %sB", bytes / Math.pow(1024.0, exp.toDouble()), pre)
 }
+
+private fun hasPermission(context: Context, permission: String): Boolean =
+    androidx.core.content.ContextCompat.checkSelfPermission(context, permission) ==
+        android.content.pm.PackageManager.PERMISSION_GRANTED
+
+/** Background location only exists on Android 10+; before that, foreground location covers it. */
+private fun hasBackgroundLocationPermission(context: Context): Boolean =
+    Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+        hasPermission(context, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
