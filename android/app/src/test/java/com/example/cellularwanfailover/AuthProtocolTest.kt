@@ -49,6 +49,11 @@ class AuthProtocolTest {
     }
 
     @Test
+    fun pairingCode() {
+        assertEquals("77FB-236A", AuthProtocol.pairingCode(signer, Vectors.GATEWAY, Vectors.PHONE))
+    }
+
+    @Test
     fun emptyBodyHash() {
         assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", AuthProtocol.sha256Hex(ByteArray(0)))
     }

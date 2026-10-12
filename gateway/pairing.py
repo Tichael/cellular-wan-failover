@@ -82,6 +82,20 @@ def replace_fields(gateway_id: str, old_phone_id: str, new_phone_id: str) -> lis
     return ["wf1-replace", gateway_id, old_phone_id, new_phone_id]
 
 
+def pairing_code_fields(gateway_id: str, phone_id: str) -> list[str]:
+    return ["wf1-code", gateway_id, phone_id]
+
+
+def pairing_code(gateway_id: str, phone_id: str, key: bytes) -> str:
+    """
+    Short code shown by `wanctl pair` and by the phone before it confirms: matching codes
+    prove the phone is pairing with the QR code this gateway displayed, not another link.
+    """
+    digest = b64url_decode(sign(key, pairing_code_fields(gateway_id, phone_id)))
+    code = digest[:4].hex().upper()
+    return f"{code[:4]}-{code[4:]}"
+
+
 def sign(key: bytes, fields: list[str]) -> str:
     if any("\n" in f for f in fields):
         raise ValueError("Signed fields must not contain newlines")

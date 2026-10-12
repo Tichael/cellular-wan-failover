@@ -109,7 +109,8 @@ class ControlHttpServerTest {
         body: String = "",
         from: TestGateway = gateway,
         challenge: String = challenge(),
-        signWith: MessageSigner = from.signer
+        signWith: MessageSigner = from.signer,
+        chunked: Boolean = false
     ): Answer {
         val bytes = body.toByteArray()
         val request = from.request(challenge, method, path, bytes, signWith = signWith)
@@ -122,6 +123,7 @@ class ControlHttpServerTest {
         if (method == "POST") {
             conn.doOutput = true
             conn.setRequestProperty("Content-Type", "application/json")
+            if (chunked) conn.setChunkedStreamingMode(1024)
             conn.outputStream.use { it.write(bytes) }
         }
         return conn.readAnswer(request.nonce!!)
@@ -298,5 +300,33 @@ class ControlHttpServerTest {
         val answer = signedCall("POST", "/v1/failover/start", "x".repeat(20_000))
         assertEquals(413, answer.code)
         assertNull(startedBy)
+    }
+
+    @Test
+    fun testOversizedChunkedBodyIsRejected() {
+        // No Content-Length to check up front: the body must still be read with a bound
+        val answer = signedCall("POST", "/v1/failover/start", "x".repeat(20_000), chunked = true)
+        assertEquals(413, answer.code)
+        assertNull(startedBy)
+    }
+
+    @Test
+    fun testChunkedBodyWithinLimitIsAccepted() {
+        val answer = signedCall("POST", "/v1/failover/start", "{\"gateway_public_key\":\"$validGatewayKey\"}", chunked = true)
+        assertEquals(200, answer.code)
+        assertSignedByPhone(answer)
+    }
+
+    @Test
+    fun testCompletingADroppedPairingIsRefused() {
+        val newcomer = TestGateway(name = "Cottage")
+        auth.beginPairing(newcomer.invite, "Home")
+        val context = (auth.authenticate(
+            newcomer.request(auth.issueChallenge(), "POST", "/v1/pair/complete", "{}".toByteArray()), "Home", allowPending = true
+        ) as com.example.cellularwanfailover.auth.AuthResult.Accepted).context
+        // Timed out (or left the Wi-Fi) between the signature check and the completion
+        auth.cancelPairing("Timed out.")
+        assertNull(auth.completePairing(context, "Mom's Pixel"))
+        assertEquals(1, auth.pairings.value.size)
     }
 }

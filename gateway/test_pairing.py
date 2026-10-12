@@ -38,6 +38,9 @@ class TestVectors:
         fields = pairing.replace_fields(GW_ID, "b2xkLXBob25lLWlkLTAwMQ", VECTOR_PHONE)
         assert pairing.sign(VECTOR_KEY, fields) == "6EiGtiiw2MujSygFh6qP7hbD9_lR1eCe2KntmXjJWtk"
 
+    def test_pairing_code(self):
+        assert pairing.pairing_code(GW_ID, VECTOR_PHONE, VECTOR_KEY) == "77FB-236A"
+
     def test_pair_link(self):
         link = pairing.build_pair_link(GW_ID, "Pi Home & Co", VECTOR_PHONE, VECTOR_KEY)
         assert link == (
@@ -187,6 +190,7 @@ class TestRunPairing:
         assert query["gw"] == [store.gateway_id()]
         assert query["pid"] == [phone.phone_id]
         assert pairing.b64url_decode(query["k"][0]) == phone.key
+        assert f"Pairing code: {pairing.pairing_code(store.gateway_id(), phone.phone_id, phone.key)}" in out
 
     def test_phone_name_is_sanitized(self, tmp_path, phone):
         store = pairing.PairingStore(str(tmp_path))
@@ -231,3 +235,41 @@ class TestRunPairing:
         answers = iter([(500, {"message": "not ready"}), (200, {"name": "Pixel", "ssid": "Home"})])
         assert pair(store, phone, lambda: next(answers)) == 0
         assert store.get(phone.phone_id) is not None
+
+
+class TestReleaseBeforeUnpair:
+    def release(self, store, phone, discovery=StubDiscovery):
+        args = argparse.Namespace(discovery_port=0, http_port=phone.port if phone else 1)
+        record = store.phones()[0]
+        with patch("watchdog.PhoneDiscovery", discovery):
+            watchdog.release_before_unpair(store, record, args, wait=0.1)
+
+    def setup_phone(self, tmp_path, phone):
+        store = pairing.PairingStore(str(tmp_path))
+        phone.gateway_id = store.gateway_id()
+        store.add(phone_record(phone.phone_id, "Pixel", key=phone.key))
+        return store
+
+    def test_stops_the_relay_while_the_key_still_works(self, tmp_path, phone, capsys):
+        store = self.setup_phone(tmp_path, phone)
+        phone.routes["/v1/failover/stop"] = (200, {"result": "idle"})
+        self.release(store, phone)
+        assert [(m, p) for m, p, _ in phone.requests] == [("POST", "/v1/failover/stop")]
+        assert "back to standby" in capsys.readouterr().out
+
+    def test_relay_serving_another_gateway_is_left_alone(self, tmp_path, phone, capsys):
+        store = self.setup_phone(tmp_path, phone)
+        phone.routes["/v1/failover/stop"] = (409, {"result": "busy", "message": "Relay in use by another gateway"})
+        self.release(store, phone)
+        assert "Could not" not in capsys.readouterr().out
+
+    def test_phone_not_on_the_network(self, tmp_path, phone, capsys):
+        store = self.setup_phone(tmp_path, phone)
+
+        class SilentDiscovery(StubDiscovery):
+            def wait_for_phone(self, timeout, phone_id):
+                raise TimeoutError()
+
+        self.release(store, phone, SilentDiscovery)
+        assert phone.requests == []
+        assert "stop it in the app" in capsys.readouterr().out

@@ -217,6 +217,11 @@ private fun PairingScreen(
 
                                 else -> {
                                     Text(bold("Wi-Fi network: ", ssid), fontSize = 15.sp)
+                                    Text(bold("Pairing code: ", invite.code), fontSize = 15.sp)
+                                    Message(
+                                        "Check that 'wanctl pair' on your gateway shows the same code. If it doesn't, " +
+                                            "or you didn't start the pairing yourself, cancel."
+                                    )
                                     Message(
                                         "Pairing trusts this Wi-Fi network: the gateway can then use this phone's mobile data " +
                                             "for failover while the phone is connected to '$ssid'. The gateway must be on this " +

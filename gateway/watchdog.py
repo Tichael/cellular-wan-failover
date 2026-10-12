@@ -644,6 +644,7 @@ def run_pairing(store: "pairing.PairingStore", args: argparse.Namespace) -> int:
     print("with the Cellular WAN Failover app or the camera app:\n")
     print_pairing_qr(link)
     print(f"\nOr paste this link in the app:\n{link}\n")
+    print(f"Pairing code: {pairing.pairing_code(gateway_id, phone_id, key)}  (check that the phone shows the same code)\n")
     print(f"Waiting for the phone (up to {args.pair_timeout // 60} min, Ctrl+C to cancel)...", flush=True)
 
     discovery = PhoneDiscovery(
@@ -691,6 +692,46 @@ def run_pairing(store: "pairing.PairingStore", args: argparse.Namespace) -> int:
     return 1
 
 
+def manual_stop(routing: "RoutingManager", discovery: "PhoneDiscovery", coordinator: "FailoverCoordinator", listen: float = 6.0):
+    """`wanctl stop`: tears down the gateway side, then puts every paired phone heard back to standby."""
+    # Local teardown first: it must work even when no phone can be reached
+    routing.disable_routing_and_nat()
+    routing.teardown_wireguard_interface()
+    # Listen one broadcast interval so every phone (only one carries the failover) is known
+    time.sleep(listen)
+    phones = discovery.get_available_phones()
+    if not phones:
+        logger.warning("No paired smartphone heard: if a relay is still running, stop it in the app.")
+    for phone_id, ip in phones:
+        logger.info(f"Manual deactivation on {coordinator.label(phone_id, ip)}...")
+        coordinator.release_phone(phone_id, ip)
+    logger.info("Cellular failover stopped.")
+
+
+def release_before_unpair(store: "pairing.PairingStore", phone: "pairing.PairedPhone", args: argparse.Namespace, wait: float = 6.0):
+    """Best effort: stops a relay the phone may be running for this gateway, while the key still works."""
+    gateway_id = store.gateway_id()
+    discovery = PhoneDiscovery(gateway_id=gateway_id, key_for=lambda pid: phone.key if pid == phone.id else None, port=args.discovery_port)
+    discovery.start()
+    try:
+        _, ip = discovery.wait_for_phone(timeout=wait, phone_id=phone.id)
+    except TimeoutError:
+        print(f"'{phone.label}' is not on the network: if its relay is still running, stop it in the app.")
+        return
+    finally:
+        discovery.stop()
+    client = AndroidFailoverClient(phone_ip=ip, phone_id=phone.id, key=phone.key, gateway_id=gateway_id, http_port=args.http_port)
+    try:
+        client.stop_failover(timeout=3.0, attempts=1)
+        print(f"Put '{phone.label}' back to standby.")
+    except PhoneRequestError as e:
+        if e.status != 409:
+            print(f"Could not put '{phone.label}' back to standby: {e}")
+        # 409: its relay is serving another gateway, nothing to stop for us
+    except Exception as e:
+        print(f"Could not put '{phone.label}' back to standby: {e}")
+
+
 def list_phones(store: "pairing.PairingStore", discovery: "PhoneDiscovery"):
     phones = store.phones()
     if not phones:
@@ -719,6 +760,8 @@ def main():
 
     if args.unpair:
         phone = resolve_phone(store, args.unpair)
+        # Once removed, this gateway can no longer sign the request that stops the phone's relay
+        release_before_unpair(store, phone, args)
         store.remove(phone.id)
         print(f"Removed '{phone.label}' ({phone.id}). Remove the gateway in the phone's app too.")
         return
@@ -806,15 +849,7 @@ def main():
         return
 
     if args.stop_now:
-        wait_for_phone()  # waits for a first smartphone
-        # Listen one more broadcast interval so every phone (only one carries the failover) is known
-        time.sleep(6)
-        routing.disable_routing_and_nat()
-        routing.teardown_wireguard_interface()
-        for phone_id, ip in discovery.get_available_phones():
-            logger.info(f"Manual deactivation on {coordinator.label(phone_id, ip)}...")
-            coordinator.release_phone(phone_id, ip)
-        logger.info("Cellular failover stopped.")
+        manual_stop(routing, discovery, coordinator)
         discovery.stop()
         return
 

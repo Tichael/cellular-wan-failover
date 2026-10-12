@@ -52,13 +52,29 @@ class GatewayAuthenticatorTest {
     }
 
     @Test
-    fun challengesAreBounded() {
+    fun challengesAreBoundedPerClient() {
         auth.pair(gateway, "Home")
-        val first = auth.issueChallenge()
-        repeat(GatewayAuthenticator.MAX_CHALLENGES) { auth.issueChallenge() }
-        // Flooding the phone with challenge requests only evicts the oldest ones
+        val first = auth.issueChallenge("10.0.0.2")
+        repeat(GatewayAuthenticator.MAX_CHALLENGES_PER_CLIENT) { auth.issueChallenge("10.0.0.2") }
+        // A client asking for too many challenges only evicts its own oldest ones
         assertEquals("unknown or expired challenge", rejectionOf(auth.authenticate(gateway.request(first), "Home")))
-        assertTrue(auth.authenticate(gateway.request(auth.issueChallenge()), "Home") is AuthResult.Accepted)
+        assertTrue(auth.authenticate(gateway.request(auth.issueChallenge("10.0.0.2")), "Home") is AuthResult.Accepted)
+    }
+
+    @Test
+    fun floodingFromAnotherClientDoesNotEvictTheGatewaysChallenge() {
+        auth.pair(gateway, "Home")
+        val challenge = auth.issueChallenge("10.0.0.2")
+        repeat(GatewayAuthenticator.MAX_CHALLENGES * 2) { auth.issueChallenge("10.0.0.66") }
+        assertTrue(auth.authenticate(gateway.request(challenge), "Home") is AuthResult.Accepted)
+    }
+
+    @Test
+    fun challengesAreBoundedOverall() {
+        auth.pair(gateway, "Home")
+        val first = auth.issueChallenge("10.0.0.2")
+        repeat(GatewayAuthenticator.MAX_CHALLENGES) { auth.issueChallenge("10.0.1.$it") }
+        assertEquals("unknown or expired challenge", rejectionOf(auth.authenticate(gateway.request(first), "Home")))
     }
 
     @Test

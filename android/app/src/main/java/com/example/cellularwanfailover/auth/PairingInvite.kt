@@ -13,6 +13,9 @@ class PairingInvite(
     val phoneId: String,
     val key: ByteArray
 ) {
+    /** Must match the code `wanctl pair` shows next to the QR code */
+    val code: String by lazy { AuthProtocol.pairingCode(memorySigner(key), gatewayId, phoneId) }
+
     companion object {
         private const val MAX_NAME_LENGTH = 64
 

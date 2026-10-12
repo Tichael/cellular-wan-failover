@@ -16,6 +16,7 @@ from watchdog import (
     PhoneRequestError,
     RoutingManager,
     activate_failover,
+    manual_stop,
     build_wg_config,
     check_primary_wan,
     check_tunnel_canary,
@@ -549,6 +550,19 @@ class TestFailoverCoordinator:
         )
         client = coordinator.client(*self.A)
         assert (client.phone_ip, client.phone_id, client.key, client.gateway_id) == ("10.20.0.10", "phoneA", PHONE_KEY, GW_ID)
+
+    def test_manual_stop_without_phones_still_tears_down_locally(self):
+        coordinator, routing, _, _ = self.make([])
+        manual_stop(routing, coordinator.discovery, coordinator, listen=0)
+        routing.disable_routing_and_nat.assert_called_once()
+        routing.teardown_wireguard_interface.assert_called_once()
+
+    def test_manual_stop_releases_every_phone_heard(self):
+        coordinator, routing, clients, _ = self.make([self.A, self.B])
+        manual_stop(routing, coordinator.discovery, coordinator, listen=0)
+        routing.teardown_wireguard_interface.assert_called_once()
+        clients["phoneA"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
+        clients["phoneB"].stop_failover.assert_called_once_with(timeout=3.0, attempts=1)
 
     def test_activate_without_phones(self):
         coordinator, _, _, fake_activate = self.make([])

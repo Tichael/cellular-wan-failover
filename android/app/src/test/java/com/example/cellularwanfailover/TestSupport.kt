@@ -70,7 +70,7 @@ fun GatewayAuthenticator.pair(gateway: TestGateway, ssid: String, phoneName: Str
     beginPairing(gateway.invite, ssid).let {
         val request = gateway.request(issueChallenge(), "POST", "/v1/pair/complete", "{}".toByteArray())
         val accepted = authenticate(request, ssid, allowPending = true) as com.example.cellularwanfailover.auth.AuthResult.Accepted
-        completePairing(accepted.context, phoneName)
+        checkNotNull(completePairing(accepted.context, phoneName))
     }
 
 class FakeSharedPreferences : SharedPreferences {

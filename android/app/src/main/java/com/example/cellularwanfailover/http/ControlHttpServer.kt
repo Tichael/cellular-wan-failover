@@ -19,15 +19,16 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.cio.CIO
 import io.ktor.server.engine.EmbeddedServer
 import io.ktor.server.engine.embeddedServer
-import io.ktor.server.request.contentLength
-import io.ktor.server.request.receive
+import io.ktor.server.request.receiveChannel
 import io.ktor.server.response.header
 import io.ktor.server.response.respondBytes
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
 import io.ktor.server.routing.route
 import io.ktor.server.routing.routing
+import io.ktor.utils.io.readRemaining
 import kotlinx.serialization.encodeToString
+import kotlinx.io.readByteArray
 import kotlinx.serialization.json.Json
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -101,7 +102,7 @@ class ControlHttpServer(
             val serverEngine = embeddedServer(CIO, port = port, host = bindAddress) {
                 routing {
                     get("/v1/challenge") {
-                        val body = json.encodeToString(ChallengeResponse(authenticator.issueChallenge()))
+                        val body = json.encodeToString(ChallengeResponse(authenticator.issueChallenge(call.request.local.remoteHost)))
                         call.respondBytes(body.toByteArray(Charsets.UTF_8), ContentType.Application.Json, HttpStatusCode.OK)
                     }
 
@@ -154,6 +155,10 @@ class ControlHttpServer(
 
                     signed(HttpMethod.Post, "/v1/pair/complete", allowPending = true) { auth, _ ->
                         val response = authenticator.completePairing(auth, delegate.deviceName)
+                            ?: return@signed reply(
+                                HttpStatusCode.Conflict,
+                                FailoverActionResponse(result = "error", message = "Pairing cancelled or expired on the phone")
+                            )
                         delegate.logEvent("Pairing", "Paired with gateway '${auth.gatewayName}' on Wi-Fi '${response.ssid}'")
                         reply(HttpStatusCode.OK, response)
                     }
@@ -184,11 +189,12 @@ class ControlHttpServer(
         route(path, method) {
             handle {
                 val clientIp = call.request.local.remoteHost
-                if ((call.request.contentLength() ?: 0L) > MAX_BODY_BYTES) {
+                // Bounded read: a chunked body has no Content-Length to check up front
+                val body = call.receiveChannel().readRemaining(MAX_BODY_BYTES + 1L).readByteArray()
+                if (body.size > MAX_BODY_BYTES) {
                     call.respondUnsigned(HttpStatusCode.PayloadTooLarge, "Body too large")
                     return@handle
                 }
-                val body = call.receive<ByteArray>()
                 val headers = call.request.headers
                 val request = SignedRequest(
                     gatewayId = headers[AuthProtocol.HEADER_GATEWAY],

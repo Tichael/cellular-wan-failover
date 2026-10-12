@@ -67,6 +67,18 @@ object AuthProtocol {
     fun replaceFields(gatewayId: String, oldPhoneId: String, newPhoneId: String) =
         listOf("wf1-replace", gatewayId, oldPhoneId, newPhoneId)
 
+    fun pairingCodeFields(gatewayId: String, phoneId: String) = listOf("wf1-code", gatewayId, phoneId)
+
+    /**
+     * Short code shown by `wanctl pair` and before the user confirms a pairing: matching codes
+     * prove the link is the one that gateway displayed, not one from another source.
+     */
+    fun pairingCode(signer: MessageSigner, gatewayId: String, phoneId: String): String {
+        val digest = requireNotNull(b64urlDecode(signer.sign(pairingCodeFields(gatewayId, phoneId))))
+        val hex = digest.take(4).joinToString("") { "%02X".format(it) }
+        return "${hex.take(4)}-${hex.drop(4)}"
+    }
+
     /** The bytes that get signed; null if a field contains a newline (it could shift fields). */
     fun message(fields: List<String>): ByteArray? =
         if (fields.any { '\n' in it }) null else fields.joinToString("\n").toByteArray(Charsets.UTF_8)

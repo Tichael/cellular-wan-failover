@@ -31,6 +31,7 @@ All binary values are written as base64url without padding. Signatures are `base
 | Response | `wf1-resp`, gateway_id, phone_id, nonce, HTTP status, hex(sha256(body)) |
 | Discovery | `wf1-disc`, gateway_id, phone_id, phone Wi-Fi IPv4 |
 | Replace | `wf1-replace`, gateway_id, old phone_id, new phone_id |
+| Pairing code | `wf1-code`, gateway_id, phone_id |
 
 ## Pairing
 
@@ -39,8 +40,10 @@ wanctl pair                                    Phone (app)
 ───────────                                    ───────────
 new phone_id + secret, shown as QR code:
 wanfailover://pair?v=1&gw=…&gn=<name>&pid=…&k=…
+and the pairing code
                                                scan (in-app scanner or camera app) or paste
                                                must be on Wi-Fi; records its SSID
+                                               shows the pairing code (same as wanctl pair)
                                                user confirms → pairing PENDING (in memory)
                                                starts services on that Wi-Fi, broadcasts a
                                                signed discovery entry for the pending pairing
@@ -57,6 +60,8 @@ in /config/pairing.json under its name
 - Neither side saves anything until this exchange succeeds. Each side gives up after about 5 minutes, and the phone also gives up if it leaves that Wi-Fi network. `wanctl pair` retries the completion until the phone accepts it, and a repeated completion gets the same answer.
 - **The pairing is tied to the Wi-Fi network:** the phone accepts requests for a pairing only while it is on the SSID that pairing was made on. The phone's trusted networks are exactly the SSIDs of its pairings. If the SSID changes, the phone has to be paired again.
 - **Pairing the same gateway again** replaces the phone's earlier pairing with it. Then `replaces` = `{phone_id: old, sig: Replace message signed with the OLD secret}`, so the gateway removes the old entry only if the phone proves it held that pairing.
+- **Pairing code:** `wanctl pair` and the phone's confirmation screen both show a short code: the first 4 bytes of the Pairing code signature as `XXXX-XXXX` hex. If they match, the phone is pairing with the QR code this gateway displayed, not a link from somewhere else.
+- If the pending pairing was dropped on the phone (timeout, Wi-Fi change, user) by the time a completion arrives, the phone answers `409` (signed) and the gateway saves nothing.
 - The phone name comes from Android's device name and is only used for display. The gateway strips control characters from it before printing it.
 - A pairing link can open the app from any QR code or web page. That's why the app always asks for confirmation, shows the gateway name and the Wi-Fi network, and warns when the pairing replaces an existing one.
 
@@ -70,7 +75,7 @@ The packet contains one entry per gateway paired on the current Wi-Fi network, p
 
 ## Control requests (HTTP, port 8989, phone's Wi-Fi address only)
 
-1. `GET /v1/challenge` → `{"challenge": "…"}`. This request is unauthenticated. The phone keeps at most 64 challenges, each valid for 30 s and usable once (even by a request that fails the checks).
+1. `GET /v1/challenge` → `{"challenge": "…"}`. This request is unauthenticated. The phone keeps at most 4 challenges per requesting IP address (256 in total), each valid for 30 s and usable once (even by a request that fails the checks). A device that floods the phone with challenge requests only pushes out its own challenges, not the gateway's.
 2. The gateway sends the request with these headers: `X-WF-Gateway`, `X-WF-Phone`, `X-WF-Challenge`, `X-WF-Nonce` (new random value) and `X-WF-Signature` (Request message).
 3. The phone checks: the headers are well formed → the challenge is valid and unused (it is consumed now) → the pairing exists (pending pairings only for `/v1/pair/complete`) → the phone is on that pairing's Wi-Fi → the signature is valid. Any failure returns `401` without a signature.
 4. The phone signs its answer for the gateway's nonce (`X-WF-Signature`, Response message). The gateway ignores any answer whose signature isn't valid. This is what stops an impostor from supplying the WireGuard key in `/v1/status`.
@@ -82,9 +87,9 @@ The phone's challenge and the gateway's nonce make both directions fresh without
 | `GET /v1/status` | State and the phone's WireGuard public key and port |
 | `POST /v1/failover/start` `{"gateway_public_key"}` | Start cellular + relay. `409` if another gateway is using the relay |
 | `POST /v1/failover/stop` | Stop it. `409` if another gateway started it |
-| `POST /v1/pair/complete` | Complete a pending pairing (see above) |
+| `POST /v1/pair/complete` | Complete a pending pairing (see above). `409` if it was dropped on the phone |
 
 ## Storage
 
-- **Gateway:** `/config/pairing.json` (mode `0600`, Docker volume `gateway-config`) holds the gateway ID and each phone's ID, name, SSID and secret. `wanctl pair`/`unpair` write it, using a lock and atomic replacement. The watchdog notices changes without restarting.
+- **Gateway:** `/config/pairing.json` (mode `0600`, Docker volume `gateway-config`) holds the gateway ID and each phone's ID, name, SSID and secret. `wanctl pair`/`unpair` write it, using a lock and atomic replacement. `wanctl unpair` first asks the phone (if it's on the network) to stop any relay it runs for this gateway, because the gateway can't sign that request once the pairing is gone. The watchdog notices changes without restarting.
 - **Phone:** the secrets are imported into the Android Keystore as sign-only HMAC keys and can't be read back. The list of pairings (`gateway_pairings.xml`) is excluded from backups and device transfers. A pairing whose Keystore key is missing is dropped.

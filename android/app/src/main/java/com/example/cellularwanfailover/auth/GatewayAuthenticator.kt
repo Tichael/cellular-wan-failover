@@ -74,8 +74,13 @@ class GatewayAuthenticator(
 ) {
     companion object {
         const val CHALLENGE_TTL_MS = 30_000L
-        const val MAX_CHALLENGES = 64
+        // Per requester address, so flooding the phone only evicts the flooder's own challenges
+        const val MAX_CHALLENGES_PER_CLIENT = 4
+        // Memory bound across all requesters
+        const val MAX_CHALLENGES = 256
     }
+
+    private class IssuedChallenge(val expiry: Long, val client: String)
 
     private class PendingPairing(val invite: PairingInvite, val ssid: String) {
         val signer = memorySigner(invite.key)
@@ -83,8 +88,8 @@ class GatewayAuthenticator(
 
     private val json = Json { encodeDefaults = true }
 
-    // challenge -> expiry; insertion order lets the oldest be dropped first
-    private val challenges = LinkedHashMap<String, Long>()
+    // challenge -> expiry and requester; insertion order lets the oldest be dropped first
+    private val challenges = LinkedHashMap<String, IssuedChallenge>()
 
     private var pending: PendingPairing? = null
 
@@ -104,20 +109,24 @@ class GatewayAuthenticator(
     fun isServiceSsid(ssid: String?): Boolean =
         ssid != null && (repository.isPairedSsid(ssid) || pending?.ssid == ssid)
 
+    /** A single-use challenge for the requester at [client] (its IP address). */
     @Synchronized
-    fun issueChallenge(): String {
+    fun issueChallenge(client: String = ""): String {
         val now = clockMillis()
-        challenges.entries.removeAll { it.value < now }
+        challenges.entries.removeAll { it.value.expiry < now }
+        // Drop the oldest of this requester's challenges first, never another requester's
+        val own = challenges.entries.filter { it.value.client == client }.map { it.key }
+        own.take((own.size - MAX_CHALLENGES_PER_CLIENT + 1).coerceAtLeast(0)).forEach { challenges.remove(it) }
         while (challenges.size >= MAX_CHALLENGES) {
             challenges.remove(challenges.keys.first())
         }
-        return AuthProtocol.newId().also { challenges[it] = now + CHALLENGE_TTL_MS }
+        return AuthProtocol.newId().also { challenges[it] = IssuedChallenge(now + CHALLENGE_TTL_MS, client) }
     }
 
     @Synchronized
     private fun consumeChallenge(challenge: String): Boolean {
-        val expiry = challenges.remove(challenge) ?: return false
-        return expiry >= clockMillis()
+        val issued = challenges.remove(challenge) ?: return false
+        return issued.expiry >= clockMillis()
     }
 
     /**
@@ -178,16 +187,18 @@ class GatewayAuthenticator(
     /**
      * The gateway reached us over the pairing's Wi-Fi with a valid signature: save the pairing.
      * The answer tells the gateway our name and, if this replaces an earlier pairing with it,
-     * proves (with the old secret) that the old entry is ours to retire.
+     * proves (with the old secret) that the old entry is ours to retire. Null when there is no
+     * such pairing (any more): the gateway must not save it.
      */
     @Synchronized
-    fun completePairing(context: AuthContext, phoneName: String, nowMillis: Long = System.currentTimeMillis()): PairCompleteResponse {
+    fun completePairing(context: AuthContext, phoneName: String, nowMillis: Long = System.currentTimeMillis()): PairCompleteResponse? {
         val waiting = pending
         if (!context.pending || waiting == null || waiting.invite.phoneId != context.phoneId) {
             // Already completed: the gateway is retrying
             lastCompletion?.let { (phoneId, response) -> if (phoneId == context.phoneId) return response }
             val paired = repository.find(context.gatewayId, context.phoneId)
-            return PairCompleteResponse(name = phoneName, ssid = paired?.ssid.orEmpty())
+            // Otherwise the pairing was dropped since the request was checked (timeout, Wi-Fi change...)
+            return paired?.let { PairCompleteResponse(name = phoneName, ssid = it.ssid) }
         }
 
         val invite = waiting.invite
