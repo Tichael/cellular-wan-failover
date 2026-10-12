@@ -2,9 +2,11 @@ package com.example.cellularwanfailover.controller
 
 import android.content.Context
 import android.os.Build
+import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import com.example.cellularwanfailover.auth.AndroidPairingKeyStore
+import com.example.cellularwanfailover.auth.AuthProtocol
 import com.example.cellularwanfailover.auth.GatewayAuthenticator
 import com.example.cellularwanfailover.auth.GatewayPairing
 import com.example.cellularwanfailover.auth.PairingInvite
@@ -21,6 +23,9 @@ import com.example.cellularwanfailover.model.WifiNetworkInfo
 import com.example.cellularwanfailover.network.CellularNetworkManager
 import com.example.cellularwanfailover.network.NetworkUtils
 import com.example.cellularwanfailover.network.WifiTrustMonitor
+import com.example.cellularwanfailover.power.PowerMonitor
+import com.example.cellularwanfailover.power.StandbyMode
+import com.example.cellularwanfailover.power.StandbyPolicy
 import com.wireguard.crypto.Key
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -30,6 +35,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
@@ -51,6 +57,8 @@ class FailoverController private constructor(
         // Replaced by gateway pairings (each pairing trusts the Wi-Fi it was made on)
         private const val LEGACY_TRUSTED_NETWORKS_PREFS = "trusted_networks_prefs"
         private const val UNKNOWN_SSID = "<unknown ssid>"
+        private const val STANDBY_PREFS = "standby_prefs"
+        private const val KEY_STANDBY_MODE = "standby_mode"
 
         @Volatile
         private var instance: FailoverController? = null
@@ -76,7 +84,7 @@ class FailoverController private constructor(
     val broadcaster = DiscoveryBroadcaster(
         broadcastPort = 8990,
         wifiNetworkProvider = { NetworkUtils.getWifiNetwork(appContext) },
-        payloadProvider = { authenticator.discoveryPayload(currentSsid, _wifiIp.value) }
+        payloadProvider = { authenticator.discoveryPayload(currentSsid, _wifiIp.value, standby) }
     )
     // Gateway services run on the networks of the phone's pairings (and of a pairing in progress)
     val wifiTrustMonitor = WifiTrustMonitor(appContext, authenticator::isServiceSsid, authenticator.trustChanges)
@@ -85,6 +93,18 @@ class FailoverController private constructor(
     val currentWifiNetwork: StateFlow<WifiNetworkInfo?> = wifiTrustMonitor.currentWifiInfo
     val pairings: StateFlow<List<GatewayPairing>> = authenticator.pairings
     val pairingState: StateFlow<PairingState> = authenticator.pairingState
+
+    private val powerMonitor = PowerMonitor(appContext)
+    private val standbyPrefs = appContext.getSharedPreferences(STANDBY_PREFS, Context.MODE_PRIVATE)
+
+    private val _standbyMode = MutableStateFlow(StandbyMode.fromStorage(standbyPrefs.getString(KEY_STANDBY_MODE, null)))
+    val standbyMode: StateFlow<StandbyMode> = _standbyMode.asStateFlow()
+
+    /** True while the phone offers its gateway an always-on tunnel (hot standby) */
+    private val _standbyHot = MutableStateFlow(false)
+    val standbyHot: StateFlow<Boolean> = _standbyHot.asStateFlow()
+
+    val pluggedIn: StateFlow<Boolean> = powerMonitor.pluggedIn
 
     private val _failoverState = MutableStateFlow(FailoverState.IDLE)
     val failoverState: StateFlow<FailoverState> = _failoverState.asStateFlow()
@@ -141,6 +161,9 @@ class FailoverController private constructor(
     override val wireguardPeerIp: String
         get() = WireGuardManager.TUNNEL_PI_IP
 
+    override val standby: String
+        get() = if (_standbyHot.value) AuthProtocol.STANDBY_HOT else AuthProtocol.STANDBY_COLD
+
     init {
         // Forward logs from components
         wireGuardManager.onLog = { msg, isErr -> logEvent("WireGuard", msg, isErr) }
@@ -176,6 +199,7 @@ class FailoverController private constructor(
 
     private var isServiceRunning = false
     private var trustObservationJob: Job? = null
+    private var standbyJob: Job? = null
     private val httpServerLock = Any()
     private var lastHttpBindError: String? = null
 
@@ -185,6 +209,8 @@ class FailoverController private constructor(
 
         logEvent("FailoverController", "Starting service and network trust monitoring...")
         wifiTrustMonitor.start()
+        powerMonitor.start()
+        startStandbyPolicy()
 
         trustObservationJob?.cancel()
         trustObservationJob = scope.launch {
@@ -265,7 +291,50 @@ class FailoverController private constructor(
         trustObservationJob = null
 
         wifiTrustMonitor.stop()
+        standbyJob?.cancel()
+        standbyJob = null
+        powerMonitor.stop()
         pauseGatewayServices()
+    }
+
+    fun setStandbyMode(mode: StandbyMode) {
+        if (_standbyMode.value == mode) return
+        standbyPrefs.edit().putString(KEY_STANDBY_MODE, mode.storageValue).apply()
+        _standbyMode.value = mode
+        logEvent("Standby", "Standby mode: ${mode.storageValue}")
+    }
+
+    /** Works out hot/cold standby from the mode and the power state, and announces changes. */
+    private fun startStandbyPolicy() {
+        standbyJob?.cancel()
+        standbyJob = scope.launch {
+            var wasPlugged: Boolean? = null
+            // Unplugged when the service starts: no grace, the phone is simply on battery
+            var unpluggedAt = Long.MIN_VALUE / 2
+            combine(_standbyMode, powerMonitor.pluggedIn) { mode, plugged -> mode to plugged }
+                .collectLatest { (mode, plugged) ->
+                    if (wasPlugged == true && !plugged) unpluggedAt = SystemClock.elapsedRealtime()
+                    wasPlugged = plugged
+                    while (true) {
+                        val unpluggedFor = if (plugged) null else SystemClock.elapsedRealtime() - unpluggedAt
+                        updateStandby(StandbyPolicy.isHot(mode, unpluggedFor))
+                        val wait = StandbyPolicy.millisUntilChange(mode, unpluggedFor) ?: break
+                        delay(wait + 100)
+                    }
+                }
+        }
+    }
+
+    private fun updateStandby(hot: Boolean) {
+        if (_standbyHot.value == hot) return
+        _standbyHot.value = hot
+        logEvent(
+            "Standby",
+            if (hot) "Hot standby: offering the gateway an always-on tunnel"
+            else "Cold standby: cellular only during an outage"
+        )
+        // The gateway learns about it with the next broadcast: send it now
+        broadcaster.broadcastNow()
     }
 
     sealed interface PairingStartResult {

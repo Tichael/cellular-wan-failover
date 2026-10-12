@@ -50,6 +50,7 @@ class ControlHttpServerTest {
         override val wireguardPublicKey: String get() = "mockWireguardPublicKey=="
         override val wireguardTunnelIp: String get() = "10.100.0.1"
         override val wireguardPeerIp: String get() = "10.100.0.2"
+        override val standby: String get() = "hot"
         override suspend fun startFailover(gatewayPublicKey: Key, gatewayId: String): FailoverStartResult {
             startedBy = gatewayId
             receivedGatewayKey = gatewayPublicKey
@@ -156,6 +157,7 @@ class ControlHttpServerTest {
         assertEquals("10.20.0.50", status.wifi_ip)
         assertEquals(12345L, status.bytes_transmitted)
         assertEquals("mockWireguardPublicKey==", status.wireguard?.public_key)
+        assertEquals("hot", status.standby)
     }
 
     @Test

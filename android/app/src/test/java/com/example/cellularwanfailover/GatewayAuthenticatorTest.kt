@@ -283,6 +283,17 @@ class GatewayAuthenticatorTest {
         assertEquals(gateway.gatewayId, entry.gw)
         assertEquals(gateway.phoneId, entry.pid)
         assertTrue(gateway.signer.verify(entry.sig, AuthProtocol.discoveryFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23")))
+        assertEquals("cold", entry.standby)
+        assertTrue(gateway.signer.verify(entry.standby_sig, AuthProtocol.standbyFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "cold")))
+    }
+
+    @Test
+    fun discoveryAnnouncesHotStandby() {
+        auth.pair(gateway, "Home")
+        val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23", "hot")!!.toString(Charsets.UTF_8))
+        val entry = payload.pairings.single()
+        assertEquals("hot", entry.standby)
+        assertTrue(gateway.signer.verify(entry.standby_sig, AuthProtocol.standbyFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "hot")))
     }
 
     @Test
@@ -290,6 +301,7 @@ class GatewayAuthenticatorTest {
         auth.beginPairing(gateway.invite, "Home")
         val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "10.0.0.5")!!.toString(Charsets.UTF_8))
         assertEquals(gateway.phoneId, payload.pairings.single().pid)
+        assertNull(payload.pairings.single().standby)
     }
 
     @Test

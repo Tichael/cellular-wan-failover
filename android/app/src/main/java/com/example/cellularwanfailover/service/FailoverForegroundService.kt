@@ -102,18 +102,19 @@ class FailoverForegroundService : Service() {
         stateObservationJob = scope.launch {
             kotlinx.coroutines.flow.combine(
                 controller.failoverState,
-                controller.isNetworkTrusted
-            ) { state, isTrusted ->
-                Pair(state, isTrusted)
-            }.collect { (state, isTrusted) ->
-                val notification = buildNotification(state, isTrusted)
+                controller.isNetworkTrusted,
+                controller.standbyHot
+            ) { state, isTrusted, hot ->
+                Triple(state, isTrusted, hot)
+            }.collect { (state, isTrusted, hot) ->
+                val notification = buildNotification(state, isTrusted, hot)
                 val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
                 nm.notify(NOTIFICATION_ID, notification)
             }
         }
     }
 
-    private fun buildNotification(state: FailoverState, isTrusted: Boolean): Notification {
+    private fun buildNotification(state: FailoverState, isTrusted: Boolean, hot: Boolean = false): Notification {
         val contentIntent = PendingIntent.getActivity(
             this,
             0,
@@ -127,9 +128,9 @@ class FailoverForegroundService : Service() {
             "Paused (no paired gateway on this Wi-Fi)"
         } else {
             when (state) {
-                FailoverState.IDLE -> "State: Standby (Wi-Fi active)"
+                FailoverState.IDLE -> if (hot) "State: Hot standby (waiting for the gateway)" else "State: Standby (Wi-Fi active)"
                 FailoverState.CONNECTING -> "State: Connecting cellular..."
-                FailoverState.ACTIVE -> "State: Active (4G/5G failover running)"
+                FailoverState.ACTIVE -> if (hot) "State: Hot standby (always-on 4G/5G tunnel)" else "State: Active (4G/5G failover running)"
                 FailoverState.ERROR -> "State: Cellular connection error"
             }
         }

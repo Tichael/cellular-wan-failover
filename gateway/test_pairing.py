@@ -34,6 +34,14 @@ class TestVectors:
         fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23")
         assert pairing.sign(VECTOR_KEY, fields) == "_BT36DkjoiviLRKqYY75UWrC-xtB5Z4ITgCPfnrqLCA"
 
+    @pytest.mark.parametrize("standby, signature", [
+        ("hot", "PDrQViMezitweHA66b69nGsEiiB6HA48ruIfRmOlQzE"),
+        ("cold", "z0eXs04TbUrEUcVWnnlAaUBHn9jd1qKrE24r73pZYQk"),
+    ])
+    def test_standby_signature(self, standby, signature):
+        fields = pairing.standby_fields(GW_ID, VECTOR_PHONE, "192.168.1.23", standby)
+        assert pairing.sign(VECTOR_KEY, fields) == signature
+
     def test_replace_signature(self):
         fields = pairing.replace_fields(GW_ID, "b2xkLXBob25lLWlkLTAwMQ", VECTOR_PHONE)
         assert pairing.sign(VECTOR_KEY, fields) == "6EiGtiiw2MujSygFh6qP7hbD9_lR1eCe2KntmXjJWtk"

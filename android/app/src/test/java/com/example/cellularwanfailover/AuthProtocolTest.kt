@@ -43,6 +43,14 @@ class AuthProtocolTest {
     }
 
     @Test
+    fun standbySignature() {
+        val hot = AuthProtocol.standbyFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "hot")
+        assertEquals("PDrQViMezitweHA66b69nGsEiiB6HA48ruIfRmOlQzE", signer.sign(hot))
+        val cold = AuthProtocol.standbyFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "cold")
+        assertEquals("z0eXs04TbUrEUcVWnnlAaUBHn9jd1qKrE24r73pZYQk", signer.sign(cold))
+    }
+
+    @Test
     fun replaceSignature() {
         val fields = AuthProtocol.replaceFields(Vectors.GATEWAY, "b2xkLXBob25lLWlkLTAwMQ", Vectors.PHONE)
         assertEquals("6EiGtiiw2MujSygFh6qP7hbD9_lR1eCe2KntmXjJWtk", signer.sign(fields))

@@ -43,6 +43,9 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -71,6 +74,7 @@ import com.example.cellularwanfailover.auth.GatewayPairing
 import com.example.cellularwanfailover.auth.PairingInvite
 import com.example.cellularwanfailover.auth.PairingState
 import com.example.cellularwanfailover.model.WifiNetworkInfo
+import com.example.cellularwanfailover.power.StandbyMode
 import com.example.cellularwanfailover.service.FailoverForegroundService
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
@@ -137,6 +141,9 @@ fun MainScreen(
     val currentWifiNetwork by controller.currentWifiNetwork.collectAsStateWithLifecycle()
     val pairings by controller.pairings.collectAsStateWithLifecycle()
     val pairingState by controller.pairingState.collectAsStateWithLifecycle()
+    val standbyMode by controller.standbyMode.collectAsStateWithLifecycle()
+    val standbyHot by controller.standbyHot.collectAsStateWithLifecycle()
+    val pluggedIn by controller.pluggedIn.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -201,7 +208,8 @@ fun MainScreen(
                 currentWifi = currentWifiNetwork,
                 isNetworkTrusted = isNetworkTrusted,
                 bytesTransmitted = bytesTransmitted,
-                wireguardPublicKey = controller.wireguardPublicKey
+                wireguardPublicKey = controller.wireguardPublicKey,
+                standbyHot = standbyHot
             )
 
             // Paired Gateways Card (each pairing trusts the Wi-Fi network it was made on)
@@ -233,6 +241,10 @@ fun MainScreen(
             ControlsCard(
                 failoverState = failoverState,
                 isNetworkTrusted = isNetworkTrusted,
+                standbyMode = standbyMode,
+                standbyHot = standbyHot,
+                pluggedIn = pluggedIn,
+                onStandbyModeChange = { controller.setStandbyMode(it) },
                 onStopFailover = {
                     scope.launch { controller.stopFailover() }
                 },
@@ -317,7 +329,8 @@ fun StatusCard(
     currentWifi: WifiNetworkInfo?,
     isNetworkTrusted: Boolean,
     bytesTransmitted: Long,
-    wireguardPublicKey: String
+    wireguardPublicKey: String,
+    standbyHot: Boolean
 ) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -368,6 +381,16 @@ fun StatusCard(
                     CellularState.CONNECTED -> "Ready / Connected" to Color(0xFF388E3C)
                 }
                 Text(text = cellText, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = cellColor)
+            }
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Text(text = "Standby:", fontSize = 13.sp)
+                Text(
+                    text = if (standbyHot) "Hot (always-on tunnel)" else "Cold (on demand)",
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 13.sp,
+                    color = if (standbyHot) Color(0xFF388E3C) else Color.Gray
+                )
             }
 
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -783,6 +806,10 @@ private fun scanPairingQr(context: Context, onResult: (String) -> Unit, onError:
 fun ControlsCard(
     failoverState: FailoverState,
     isNetworkTrusted: Boolean,
+    standbyMode: StandbyMode,
+    standbyHot: Boolean,
+    pluggedIn: Boolean,
+    onStandbyModeChange: (StandbyMode) -> Unit,
     onStopFailover: () -> Unit,
     onRequestIgnoreBattery: () -> Unit
 ) {
@@ -792,6 +819,45 @@ fun ControlsCard(
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text(
+                text = "Standby Mode",
+                fontWeight = FontWeight.SemiBold,
+                fontSize = 15.sp
+            )
+
+            val modes = listOf(
+                StandbyMode.ON_DEMAND to "On demand",
+                StandbyMode.WHILE_PLUGGED to "Plugged in",
+                StandbyMode.ALWAYS to "Always"
+            )
+            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
+                modes.forEachIndexed { index, (mode, label) ->
+                    SegmentedButton(
+                        selected = standbyMode == mode,
+                        onClick = { onStandbyModeChange(mode) },
+                        shape = SegmentedButtonDefaults.itemShape(index = index, count = modes.size)
+                    ) {
+                        Text(label, fontSize = 12.sp)
+                    }
+                }
+            }
+            Text(
+                text = when (standbyMode) {
+                    StandbyMode.ON_DEMAND ->
+                        "Cellular starts only when the gateway detects an outage (saves battery and data)."
+                    StandbyMode.WHILE_PLUGGED ->
+                        "Always-on tunnel while plugged in (" + (if (pluggedIn) "plugged in now" else "on battery now") +
+                            "), on demand on battery. The router sees its backup WAN online and switches faster."
+                    StandbyMode.ALWAYS ->
+                        "Always-on tunnel, even on battery. The router sees its backup WAN online and switches faster, " +
+                            "but the phone keeps cellular data up."
+                },
+                color = Color.Gray,
+                fontSize = 12.sp
+            )
+
+            HorizontalDivider()
+
             Text(
                 text = "Manual Controls",
                 fontWeight = FontWeight.SemiBold,
@@ -817,7 +883,9 @@ fun ControlsCard(
                 }
                 else -> {
                     Text(
-                        text = if (isNetworkTrusted) {
+                        text = if (isNetworkTrusted && standbyHot) {
+                            "Hot standby: waiting for the gateway to bring up the always-on tunnel."
+                        } else if (isNetworkTrusted) {
                             "Failover is started by the gateway when it detects a WAN outage."
                         } else {
                             "Paused: connect to a trusted Wi-Fi network."

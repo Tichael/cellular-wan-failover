@@ -33,7 +33,9 @@ data class StatusResponse(
     val wifi_ip: String?,
     val cellular_ready: Boolean,
     val bytes_transmitted: Long,
-    val wireguard: WireGuardInfo? = null
+    val wireguard: WireGuardInfo? = null,
+    /** "hot": the gateway may keep the tunnel up at all times; "cold": only during an outage */
+    val standby: String = "cold"
 )
 
 @Serializable

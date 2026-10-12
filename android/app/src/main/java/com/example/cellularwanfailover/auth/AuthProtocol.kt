@@ -24,6 +24,9 @@ object AuthProtocol {
     const val HEADER_NONCE = "X-WF-Nonce"
     const val HEADER_SIGNATURE = "X-WF-Signature"
 
+    const val STANDBY_HOT = "hot"
+    const val STANDBY_COLD = "cold"
+
     const val ID_BYTES = 16
     const val KEY_BYTES = 32
 
@@ -63,6 +66,10 @@ object AuthProtocol {
 
     fun discoveryFields(gatewayId: String, phoneId: String, phoneIp: String) =
         listOf("wf1-disc", gatewayId, phoneId, phoneIp)
+
+    /** Signed apart from the discovery entry, so older gateways and phones simply ignore it. */
+    fun standbyFields(gatewayId: String, phoneId: String, phoneIp: String, standby: String) =
+        listOf("wf1-standby", gatewayId, phoneId, phoneIp, standby)
 
     fun replaceFields(gatewayId: String, oldPhoneId: String, newPhoneId: String) =
         listOf("wf1-replace", gatewayId, oldPhoneId, newPhoneId)

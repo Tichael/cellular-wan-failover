@@ -78,6 +78,15 @@ def discovery_fields(gateway_id: str, phone_id: str, phone_ip: str) -> list[str]
     return ["wf1-disc", gateway_id, phone_id, phone_ip]
 
 
+STANDBY_HOT = "hot"
+STANDBY_COLD = "cold"
+
+
+def standby_fields(gateway_id: str, phone_id: str, phone_ip: str, standby: str) -> list[str]:
+    """Signed apart from the discovery entry, so older gateways and phones simply ignore it."""
+    return ["wf1-standby", gateway_id, phone_id, phone_ip, standby]
+
+
 def replace_fields(gateway_id: str, old_phone_id: str, new_phone_id: str) -> list[str]:
     return ["wf1-replace", gateway_id, old_phone_id, new_phone_id]
 

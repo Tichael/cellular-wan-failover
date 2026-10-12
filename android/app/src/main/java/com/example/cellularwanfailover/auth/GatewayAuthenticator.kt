@@ -51,7 +51,14 @@ data class ReplacedPairing(val phone_id: String, val sig: String)
 data class PairCompleteResponse(val name: String, val ssid: String, val replaces: ReplacedPairing? = null)
 
 @Serializable
-data class DiscoveryEntry(val gw: String, val pid: String, val sig: String)
+data class DiscoveryEntry(
+    val gw: String,
+    val pid: String,
+    val sig: String,
+    /** "hot" while the phone offers an always-on tunnel, "cold" (on demand) otherwise */
+    val standby: String? = null,
+    val standby_sig: String? = null
+)
 
 @Serializable
 data class DiscoveryPayload(
@@ -228,14 +235,18 @@ class GatewayAuthenticator(
 
     /** UDP discovery payload for the gateways paired on [currentSsid], or null if there are none. */
     @Synchronized
-    fun discoveryPayload(currentSsid: String?, wifiIp: String?): ByteArray? {
+    fun discoveryPayload(currentSsid: String?, wifiIp: String?, standby: String = AuthProtocol.STANDBY_COLD): ByteArray? {
         if (currentSsid == null || wifiIp == null) return null
         val entries = mutableListOf<DiscoveryEntry>()
         for (pairing in repository.pairings.value) {
             if (pairing.ssid != currentSsid) continue
             val signer = repository.signer(pairing) ?: continue
-            entries += discoveryEntry(pairing.gatewayId, pairing.phoneId, wifiIp, signer)
+            entries += discoveryEntry(pairing.gatewayId, pairing.phoneId, wifiIp, signer).copy(
+                standby = standby,
+                standby_sig = signer.sign(AuthProtocol.standbyFields(pairing.gatewayId, pairing.phoneId, wifiIp, standby))
+            )
         }
+        // A pending pairing can't serve yet: no standby
         pending?.takeIf { it.ssid == currentSsid }?.let {
             entries += discoveryEntry(it.invite.gatewayId, it.invite.phoneId, wifiIp, it.signer)
         }
