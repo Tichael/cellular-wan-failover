@@ -26,6 +26,10 @@ object AuthProtocol {
 
     const val STANDBY_HOT = "hot"
     const val STANDBY_COLD = "cold"
+    const val POWER_PLUGGED = "plugged"
+    const val POWER_UNPLUGGED = "unplugged"
+    const val LAST_RESORT = "last-resort"
+    const val NO_LAST_RESORT = "no-last-resort"
 
     const val ID_BYTES = 16
     const val KEY_BYTES = 32
@@ -64,8 +68,14 @@ object AuthProtocol {
     fun responseFields(gatewayId: String, phoneId: String, nonce: String, status: Int, body: ByteArray) =
         listOf("wf1-resp", gatewayId, phoneId, nonce, status.toString(), sha256Hex(body))
 
-    fun discoveryFields(gatewayId: String, phoneId: String, phoneIp: String, standby: String) =
-        listOf("wf1-disc", gatewayId, phoneId, phoneIp, standby)
+    fun discoveryFields(
+        gatewayId: String, phoneId: String, phoneIp: String, standby: String,
+        battery: Int, plugged: Boolean, minBattery: Int, lastResort: Boolean
+    ) = listOf(
+        "wf1-disc", gatewayId, phoneId, phoneIp, standby,
+        battery.toString(), if (plugged) POWER_PLUGGED else POWER_UNPLUGGED,
+        minBattery.toString(), if (lastResort) LAST_RESORT else NO_LAST_RESORT
+    )
 
     fun replaceFields(gatewayId: String, oldPhoneId: String, newPhoneId: String) =
         listOf("wf1-replace", gatewayId, oldPhoneId, newPhoneId)

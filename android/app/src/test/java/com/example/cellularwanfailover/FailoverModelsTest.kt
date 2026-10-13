@@ -30,7 +30,11 @@ class FailoverModelsTest {
                 public_key = "abc123publicKeyBase64==",
                 tunnel_ip = "10.100.0.1",
                 peer_ip = "10.100.0.2"
-            )
+            ),
+            battery = 73,
+            plugged = false,
+            min_battery = 20,
+            last_resort = true
         )
 
         val encoded = json.encodeToString(status)
@@ -40,6 +44,8 @@ class FailoverModelsTest {
         assertTrue(encoded.contains("\"cellular_ready\": true"))
         assertTrue(encoded.contains("\"bytes_transmitted\": 10485760"))
         assertTrue(encoded.contains("\"public_key\": \"abc123publicKeyBase64==\""))
+        assertTrue(encoded.contains("\"battery\": 73"))
+        assertTrue(encoded.contains("\"plugged\": false"))
 
         val decoded = json.decodeFromString<StatusResponse>(encoded)
         assertEquals(status, decoded)

@@ -23,6 +23,8 @@ import com.example.cellularwanfailover.model.WifiNetworkInfo
 import com.example.cellularwanfailover.network.CellularNetworkManager
 import com.example.cellularwanfailover.network.NetworkUtils
 import com.example.cellularwanfailover.network.WifiTrustMonitor
+import com.example.cellularwanfailover.power.BatteryPolicy
+import com.example.cellularwanfailover.power.BatterySettings
 import com.example.cellularwanfailover.power.PowerMonitor
 import com.example.cellularwanfailover.power.StandbyMode
 import com.example.cellularwanfailover.power.StandbyPolicy
@@ -59,6 +61,8 @@ class FailoverController private constructor(
         private const val UNKNOWN_SSID = "<unknown ssid>"
         private const val STANDBY_PREFS = "standby_prefs"
         private const val KEY_STANDBY_MODE = "standby_mode"
+        private const val KEY_MIN_BATTERY = "min_battery"
+        private const val KEY_LAST_RESORT = "last_resort"
 
         @Volatile
         private var instance: FailoverController? = null
@@ -84,7 +88,9 @@ class FailoverController private constructor(
     val broadcaster = DiscoveryBroadcaster(
         broadcastPort = 8990,
         wifiNetworkProvider = { NetworkUtils.getWifiNetwork(appContext) },
-        payloadProvider = { authenticator.discoveryPayload(currentSsid, _wifiIp.value, standby) }
+        payloadProvider = {
+            authenticator.discoveryPayload(currentSsid, _wifiIp.value, standby, batteryLevel, isPluggedIn, batterySettings)
+        }
     )
     // Gateway services run on the networks of the phone's pairings (and of a pairing in progress)
     val wifiTrustMonitor = WifiTrustMonitor(appContext, authenticator::isServiceSsid, authenticator.trustChanges)
@@ -105,6 +111,17 @@ class FailoverController private constructor(
     val standbyHot: StateFlow<Boolean> = _standbyHot.asStateFlow()
 
     val pluggedIn: StateFlow<Boolean> = powerMonitor.pluggedIn
+    val batteryLevelState: StateFlow<Int> = powerMonitor.batteryLevel
+
+    private val _batterySettings = MutableStateFlow(
+        BatterySettings(
+            minBattery = standbyPrefs.getInt(KEY_MIN_BATTERY, BatterySettings.DEFAULT_MIN_BATTERY)
+                .coerceIn(0, BatterySettings.MAX_MIN_BATTERY),
+            lastResort = standbyPrefs.getBoolean(KEY_LAST_RESORT, true)
+        )
+    )
+    /** Minimum battery and last resort: sent to the gateways, and enforced when one asks to start */
+    val batterySettingsState: StateFlow<BatterySettings> = _batterySettings.asStateFlow()
 
     private val _failoverState = MutableStateFlow(FailoverState.IDLE)
     val failoverState: StateFlow<FailoverState> = _failoverState.asStateFlow()
@@ -163,6 +180,15 @@ class FailoverController private constructor(
 
     override val standby: String
         get() = if (_standbyHot.value) AuthProtocol.STANDBY_HOT else AuthProtocol.STANDBY_COLD
+
+    override val batteryLevel: Int
+        get() = powerMonitor.batteryLevel.value
+
+    override val isPluggedIn: Boolean
+        get() = powerMonitor.pluggedIn.value
+
+    override val batterySettings: BatterySettings
+        get() = _batterySettings.value
 
     init {
         // Forward logs from components
@@ -304,6 +330,21 @@ class FailoverController private constructor(
         logEvent("Standby", "Standby mode: ${mode.storageValue}")
     }
 
+    fun setBatterySettings(settings: BatterySettings) {
+        val clamped = settings.copy(minBattery = settings.minBattery.coerceIn(0, BatterySettings.MAX_MIN_BATTERY))
+        if (_batterySettings.value == clamped) return
+        standbyPrefs.edit()
+            .putInt(KEY_MIN_BATTERY, clamped.minBattery)
+            .putBoolean(KEY_LAST_RESORT, clamped.lastResort)
+            .apply()
+        _batterySettings.value = clamped
+        logEvent(
+            "Battery",
+            "Minimum battery: ${clamped.minBattery}%" + if (clamped.lastResort) " (still used if no other phone can)" else " (never below it)"
+        )
+        broadcaster.broadcastNow()
+    }
+
     /** Works out hot/cold standby from the mode and the power state, and announces changes. */
     private fun startStandbyPolicy() {
         standbyJob?.cancel()
@@ -411,6 +452,11 @@ class FailoverController private constructor(
             if (!wifiTrustMonitor.isNetworkTrusted.value) {
                 logEvent("FailoverController", "Cannot start failover: untrusted network or mobile data alone", true)
                 return FailoverStartResult.Failed("Phone is not on a paired Wi-Fi network")
+            }
+
+            if (!BatteryPolicy.mayCarry(batteryLevel, isPluggedIn, batterySettings)) {
+                logEvent("FailoverController", "Refused failover start: battery ${batteryLevel}% is below the minimum (${batterySettings.minBattery}%)", true)
+                return FailoverStartResult.Declined("Battery below the phone's minimum")
             }
 
             val owner = activeGatewayId

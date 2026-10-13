@@ -46,6 +46,8 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -74,6 +76,7 @@ import com.example.cellularwanfailover.auth.GatewayPairing
 import com.example.cellularwanfailover.auth.PairingInvite
 import com.example.cellularwanfailover.auth.PairingState
 import com.example.cellularwanfailover.model.WifiNetworkInfo
+import com.example.cellularwanfailover.power.BatterySettings
 import com.example.cellularwanfailover.power.StandbyMode
 import com.example.cellularwanfailover.service.FailoverForegroundService
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -144,6 +147,8 @@ fun MainScreen(
     val standbyMode by controller.standbyMode.collectAsStateWithLifecycle()
     val standbyHot by controller.standbyHot.collectAsStateWithLifecycle()
     val pluggedIn by controller.pluggedIn.collectAsStateWithLifecycle()
+    val batteryLevel by controller.batteryLevelState.collectAsStateWithLifecycle()
+    val batterySettings by controller.batterySettingsState.collectAsStateWithLifecycle()
 
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -245,6 +250,9 @@ fun MainScreen(
                 standbyHot = standbyHot,
                 pluggedIn = pluggedIn,
                 onStandbyModeChange = { controller.setStandbyMode(it) },
+                batteryLevel = batteryLevel,
+                batterySettings = batterySettings,
+                onBatterySettingsChange = { controller.setBatterySettings(it) },
                 onStopFailover = {
                     scope.launch { controller.stopFailover() }
                 },
@@ -803,6 +811,55 @@ private fun scanPairingQr(context: Context, onResult: (String) -> Unit, onError:
 }
 
 @Composable
+fun BatterySettingsSection(
+    batteryLevel: Int,
+    pluggedIn: Boolean,
+    settings: BatterySettings,
+    onChange: (BatterySettings) -> Unit
+) {
+    // Follows the slider while dragging; saved (and sent to the gateway) when released
+    var draft by remember(settings.minBattery) { mutableStateOf(settings.minBattery.toFloat()) }
+    Text(
+        text = "Minimum Battery: ${draft.toInt()}%",
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 15.sp
+    )
+    Slider(
+        value = draft,
+        onValueChange = { draft = it },
+        onValueChangeFinished = { onChange(settings.copy(minBattery = draft.toInt())) },
+        valueRange = 0f..BatterySettings.MAX_MIN_BATTERY.toFloat(),
+        steps = BatterySettings.MAX_MIN_BATTERY / BatterySettings.MIN_BATTERY_STEP - 1
+    )
+    Text(
+        text = "Battery now: $batteryLevel%" + (if (pluggedIn) " (plugged in)" else "") +
+            ". Below the minimum on battery, the gateway uses another phone if it has one and gives this one no always-on tunnel.",
+        color = Color.Gray,
+        fontSize = 12.sp
+    )
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            text = "Use below the minimum if no other phone can",
+            fontSize = 13.sp,
+            modifier = Modifier.weight(1f)
+        )
+        Switch(
+            checked = settings.lastResort,
+            onCheckedChange = { onChange(settings.copy(lastResort = it)) }
+        )
+    }
+    Text(
+        text = if (settings.lastResort) {
+            "Keeps the internet up during an outage even when the battery is low."
+        } else {
+            "Below the minimum, this phone never carries an outage: the house stays offline if no other phone can."
+        },
+        color = Color.Gray,
+        fontSize = 12.sp
+    )
+}
+
+@Composable
 fun ControlsCard(
     failoverState: FailoverState,
     isNetworkTrusted: Boolean,
@@ -810,6 +867,9 @@ fun ControlsCard(
     standbyHot: Boolean,
     pluggedIn: Boolean,
     onStandbyModeChange: (StandbyMode) -> Unit,
+    batteryLevel: Int,
+    batterySettings: BatterySettings,
+    onBatterySettingsChange: (BatterySettings) -> Unit,
     onStopFailover: () -> Unit,
     onRequestIgnoreBattery: () -> Unit
 ) {
@@ -855,6 +915,10 @@ fun ControlsCard(
                 color = Color.Gray,
                 fontSize = 12.sp
             )
+
+            HorizontalDivider()
+
+            BatterySettingsSection(batteryLevel, pluggedIn, batterySettings, onBatterySettingsChange)
 
             HorizontalDivider()
 

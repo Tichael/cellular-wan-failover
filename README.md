@@ -240,8 +240,15 @@ Nothing to do: hot standby is on by default (`HOT_STANDBY=true`; set it to `fals
 - **Carrying**: the router switched to WAN 2. When WAN 1 is back, the phone returns to hot standby.
 - If the phone stops offering hot standby (unplugged, setting changed), the gateway releases it, unless the router is using WAN 2 at that moment: then it keeps the tunnel until WAN 1 is back. On battery, the phone still carries the traffic during an outage.
 - If several phones offer hot standby, only one carries the tunnel; another one takes over if it is lost.
+- A phone on battery below its minimum battery gets no hot standby tunnel (see "Several phones").
 
-`wanctl phones` shows the standby each phone offers.
+`wanctl phones` shows the standby each phone offers and its battery.
+
+### Several phones
+
+In the app, each phone sets its **Minimum Battery** (default 20%) and whether to **use it below the minimum if no other phone can** (default on). The phone announces these with its battery level and whether it is plugged in. The gateway uses the best phone available: battery not low (plugged in, or at least its minimum), then offering hot standby, then plugged in, then the most battery. A phone low on battery is only used when no other phone can take the failover, and only if that setting is on.
+
+During an outage, the failover moves to another phone when the active one runs low on battery (and another phone is plugged in or has at least 10% more than its own minimum; with the setting off, any phone that isn't low, and without one the phone is released even though the house goes offline), or when a phone offering hot standby shows up while a phone without it carries the outage (e.g. a phone set to *Always* comes home). The new phone starts its relay before the current one is released, so traffic stops only for a second or two, but the new cellular public IP resets open connections. If the new phone doesn't work, the current one keeps the tunnel.
 
 ### On the router (UniFi)
 
