@@ -7,6 +7,7 @@ import com.example.cellularwanfailover.auth.GatewayAuthenticator
 import com.example.cellularwanfailover.auth.PairingRepository
 import com.example.cellularwanfailover.auth.PairingState
 import com.example.cellularwanfailover.auth.memorySigner
+import com.example.cellularwanfailover.power.BatterySettings
 import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -275,7 +276,7 @@ class GatewayAuthenticatorTest {
         auth.pair(gateway, "Home")
         auth.pair(other, "Elsewhere")
 
-        val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23")!!.toString(Charsets.UTF_8))
+        val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23", "cold", 85, false, BatterySettings())!!.toString(Charsets.UTF_8))
 
         assertEquals("wan-failover", payload.service)
         assertEquals(1, payload.v)
@@ -283,16 +284,24 @@ class GatewayAuthenticatorTest {
         assertEquals(gateway.gatewayId, entry.gw)
         assertEquals(gateway.phoneId, entry.pid)
         assertEquals("cold", entry.standby)
-        assertTrue(gateway.signer.verify(entry.sig, AuthProtocol.discoveryFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "cold")))
+        assertEquals(85, entry.battery)
+        assertFalse(entry.plugged)
+        assertEquals(20, entry.min_battery)
+        assertTrue(entry.last_resort)
+        assertTrue(gateway.signer.verify(entry.sig, AuthProtocol.discoveryFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "cold", 85, false, 20, true)))
     }
 
     @Test
     fun discoveryAnnouncesHotStandby() {
         auth.pair(gateway, "Home")
-        val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23", "hot")!!.toString(Charsets.UTF_8))
+        val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23", "hot", 42, true, BatterySettings(minBattery = 35, lastResort = false))!!.toString(Charsets.UTF_8))
         val entry = payload.pairings.single()
         assertEquals("hot", entry.standby)
-        assertTrue(gateway.signer.verify(entry.sig, AuthProtocol.discoveryFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "hot")))
+        assertEquals(42, entry.battery)
+        assertTrue(entry.plugged)
+        assertEquals(35, entry.min_battery)
+        assertFalse(entry.last_resort)
+        assertTrue(gateway.signer.verify(entry.sig, AuthProtocol.discoveryFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "hot", 42, true, 35, false)))
     }
 
     @Test
@@ -317,7 +326,7 @@ class GatewayAuthenticatorTest {
         // Same vector as gateway/test_pairing.py: the gateway accepts exactly this signature
         val vectorGateway = TestGateway(gatewayId = Vectors.GATEWAY, phoneId = Vectors.PHONE, key = Vectors.KEY)
         auth.pair(vectorGateway, "Home")
-        val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23")!!.toString(Charsets.UTF_8))
-        assertEquals("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs", payload.pairings.single().sig)
+        val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23", "cold", 85, false, BatterySettings())!!.toString(Charsets.UTF_8))
+        assertEquals("zEd_0eG__PAEoFGscOeRZ-X6Og2iszvkY_J4Wrsh5dA", payload.pairings.single().sig)
     }
 }

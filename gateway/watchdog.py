@@ -7,6 +7,7 @@ to the Android cellular relay via WireGuard when an outage is detected.
 
 import argparse
 import base64
+import dataclasses
 import ipaddress
 import json
 import logging
@@ -131,6 +132,32 @@ class AndroidFailoverClient:
         return self._request("/v1/pair/complete", method="POST", body=b"{}", attempts=1)
 
 
+@dataclasses.dataclass(frozen=True)
+class PhoneState:
+    """What a phone's last signed broadcast announced."""
+    ip: str
+    last_seen: float
+    standby: str = pairing.STANDBY_COLD
+    # Battery state of charge (%) and whether the phone is plugged in
+    battery: int = 100
+    plugged: bool = False
+    # The phone's settings: its minimum battery (%), and whether it may still carry an outage
+    # below it when no other phone can
+    min_battery: int = 20
+    last_resort: bool = True
+    # When the phone (re)appeared or its address or standby last changed
+    since: float = 0.0
+
+    @property
+    def battery_low(self) -> bool:
+        """On battery, below the phone's minimum."""
+        return not self.plugged and self.battery < self.min_battery
+
+
+def format_battery(battery: int, plugged: bool) -> str:
+    return f"{battery}%{' plugged in' if plugged else ''}"
+
+
 class PhoneDiscovery:
     """
     Background UDP listener that keeps track of every paired smartphone broadcasting on the LAN.
@@ -145,7 +172,7 @@ class PhoneDiscovery:
         self.port = port
         # A phone is available while its broadcasts (every 5s) keep arriving
         self.max_age = max_age
-        self._phones: dict[str, dict[str, object]] = {}
+        self._phones: dict[str, PhoneState] = {}
         self._running = False
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
@@ -174,41 +201,68 @@ class PhoneDiscovery:
             if not isinstance(entry, dict) or entry.get("gw") != self.gateway_id:
                 continue
             phone_id = entry.get("pid")
-            standby = entry.get("standby")
-            if standby not in (pairing.STANDBY_HOT, pairing.STANDBY_COLD):
+            standby, battery, plugged = entry.get("standby"), entry.get("battery"), entry.get("plugged")
+            min_battery, last_resort = entry.get("min_battery"), entry.get("last_resort")
+            if (
+                standby not in (pairing.STANDBY_HOT, pairing.STANDBY_COLD)
+                or not pairing.valid_battery(battery) or not isinstance(plugged, bool)
+                or not pairing.valid_battery(min_battery) or not isinstance(last_resort, bool)
+            ):
                 continue
             key = self.key_for(phone_id) if isinstance(phone_id, str) else None
-            if key and pairing.verify(key, entry.get("sig"), pairing.discovery_fields(self.gateway_id, phone_id, ip, standby)):
-                self.record_phone(phone_id, ip, now, standby=standby)
+            fields = pairing.discovery_fields(self.gateway_id, phone_id, ip, standby, battery, plugged, min_battery, last_resort)
+            if key and pairing.verify(key, entry.get("sig"), fields):
+                self.record_phone(
+                    phone_id, ip, now, standby=standby, battery=battery, plugged=plugged, min_battery=min_battery, last_resort=last_resort
+                )
                 proven.append(phone_id)
         return proven
 
-    def record_phone(self, phone_id: str, ip: str, now: float | None = None, standby: str = pairing.STANDBY_COLD):
+    def record_phone(
+        self, phone_id: str, ip: str, now: float | None = None, standby: str = pairing.STANDBY_COLD,
+        battery: int = 100, plugged: bool = False, min_battery: int = 20, last_resort: bool = True,
+    ):
         now = time.monotonic() if now is None else now
         with self._lock:
             previous = self._phones.get(phone_id)
-            if previous is None or previous["ip"] != ip or now - previous["last_seen"] > self.max_age:
-                logger.info(f"[Discovery] Paired smartphone {phone_id} detected at {ip} ({standby} standby)")
-            elif previous["standby"] != standby:
+            since = now
+            if previous is None or previous.ip != ip or now - previous.last_seen > self.max_age:
+                logger.info(
+                    f"[Discovery] Paired smartphone {phone_id} detected at {ip} "
+                    f"({standby} standby, {format_battery(battery, plugged)}, minimum {min_battery}%{'' if last_resort else ' strict'})"
+                )
+            elif previous.standby != standby:
                 logger.info(f"[Discovery] Smartphone {phone_id} switched to {standby} standby")
-            self._phones[phone_id] = {"ip": ip, "last_seen": now, "standby": standby}
+            else:
+                since = previous.since
+            if previous is not None and previous.plugged != plugged and now - previous.last_seen <= self.max_age:
+                logger.info(f"[Discovery] Smartphone {phone_id} {'plugged in' if plugged else 'unplugged'} ({battery}%)")
+            self._phones[phone_id] = PhoneState(
+                ip=ip, last_seen=now, standby=standby, battery=battery, plugged=plugged,
+                min_battery=min_battery, last_resort=last_resort, since=since,
+            )
 
-    def standby_of(self, phone_id: str, now: float | None = None) -> str:
-        """Last standby announced by a phone heard within max_age (a hint: confirm it over signed HTTP)."""
+    def state_of(self, phone_id: str, now: float | None = None) -> "PhoneState | None":
+        """Last announcement of a phone heard within max_age (hints: confirm them over signed HTTP)."""
         now = time.monotonic() if now is None else now
         with self._lock:
             phone = self._phones.get(phone_id)
-        if phone is None or now - phone["last_seen"] > self.max_age:
-            return pairing.STANDBY_COLD
-        return phone["standby"]
+        if phone is None or now - phone.last_seen > self.max_age:
+            return None
+        return phone
+
+    def standby_of(self, phone_id: str, now: float | None = None) -> str:
+        """Last standby announced by a phone heard within max_age (a hint: confirm it over signed HTTP)."""
+        phone = self.state_of(phone_id, now)
+        return phone.standby if phone else pairing.STANDBY_COLD
 
     def get_available_phones(self, now: float | None = None) -> list[tuple[str, str]]:
         """(phone_id, ip) of the phones heard within max_age, most recently seen first."""
         now = time.monotonic() if now is None else now
         with self._lock:
-            fresh = [(pid, p) for pid, p in self._phones.items() if now - p["last_seen"] <= self.max_age]
-        fresh.sort(key=lambda item: item[1]["last_seen"], reverse=True)
-        return [(pid, p["ip"]) for pid, p in fresh]
+            fresh = [(pid, p) for pid, p in self._phones.items() if now - p.last_seen <= self.max_age]
+        fresh.sort(key=lambda item: item[1].last_seen, reverse=True)
+        return [(pid, p.ip) for pid, p in fresh]
 
     def _listen_loop(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -409,11 +463,12 @@ def build_wg_config(private_key: str, phone_public_key: str, phone_ip: str, port
     )
 
 
-def activate_failover(client: "AndroidFailoverClient", routing: "RoutingManager", standby: bool = False) -> dict:
+def start_phone_relay(client: "AndroidFailoverClient", standby: bool = False) -> str:
     """
-    Generates a fresh gateway key, starts the phone relay, and brings up wg0 with routing/NAT.
-    With [standby] (no outage), the phone's signed status must confirm it offers hot standby:
-    discovery only hints at it.
+    Generates a fresh gateway key and starts the phone relay with it; returns the wg0 config
+    to bring up. With [standby] (no outage, or moving to a hot standby phone), the phone's
+    signed status must confirm it offers hot standby: discovery only hints at it.
+    Nothing changes on the gateway, so a failure here leaves the current tunnel alone.
     """
     private_key, public_key = generate_wg_keypair()
 
@@ -435,17 +490,26 @@ def activate_failover(client: "AndroidFailoverClient", routing: "RoutingManager"
 
     res = client.start_failover(public_key)
     logger.info(f"Smartphone wake response: {res}")
+    return config
 
+
+def bring_up_tunnel(routing: "RoutingManager", config: str):
+    """(Re)builds wg0 from [config], then the routing/NAT towards it."""
     routing.setup_wireguard_interface(config)
     routing.enable_routing_and_nat()
-    return res
 
 
 class FailoverCoordinator:
     """
     Owns the active failover: which smartphone carries it, whether its tunnel still
     answers, and handing it over to another phone when it is lost (app crash, empty
-    battery, out of Wi-Fi range...). Several phones may be available (e.g. a family's).
+    battery, out of Wi-Fi range...) or when a better one is available during an outage.
+    Several phones may be available (e.g. a family's).
+
+    Phones are ranked by: battery not low, offering hot standby (always-on: the phone's
+    owner chose it as the backup), plugged in, then the higher battery level. Each phone
+    sets its own minimum battery: below it (on battery), the phone is only used when no
+    other phone can be, and only if its owner allows it (last resort).
     """
 
     def __init__(
@@ -463,6 +527,9 @@ class FailoverCoordinator:
         standby_confirm_interval: float = 60.0,
         standby_retry_min: float = 30.0,
         standby_retry_max: float = 300.0,
+        switch_battery_margin: int = 10,
+        switch_stable_after: float = 60.0,
+        switch_probe_attempts: int = 3,
     ):
         self.discovery = discovery
         self.routing = routing
@@ -473,8 +540,9 @@ class FailoverCoordinator:
         self.ping_timeout = ping_timeout
         self.tunnel_fail_threshold = tunnel_fail_threshold
         self.client_factory = client_factory or AndroidFailoverClient
-        # (phone_id, ip) of the phone carrying the failover
+        # (phone_id, ip) of the phone carrying the failover, and the wg0 config built for it
         self.active_phone: tuple[str, str] | None = None
+        self.active_config: str | None = None
         self.tunnel_failures = 0
         # Hot standby: keep the tunnel up without an outage for phones that offer it
         self.hot_standby = hot_standby
@@ -489,6 +557,16 @@ class FailoverCoordinator:
         self.standby_retry_at = 0.0
         # Hot phones that were available when the last attempt failed: the backoff applies to them
         self.standby_failed_phones: set[str] = set()
+        # A phone on battery takes over from a low one only with this much more than its minimum
+        self.switch_battery_margin = switch_battery_margin
+        # Planned switches only go to phones announcing the same thing for this long
+        self.switch_stable_after = switch_stable_after
+        self.switch_probe_attempts = switch_probe_attempts
+        # phone_id -> (retry_at, next delay) after a failed planned switch to it
+        self.switch_backoff: dict[str, tuple[float, float]] = {}
+        # No low-battery switch check before this (the active phone's signed status said it's fine)
+        self.switch_check_at = 0.0
+        self.low_battery_reported = False
 
     @property
     def active(self) -> bool:
@@ -526,17 +604,45 @@ class FailoverCoordinator:
         """The phone announces hot standby (and this gateway allows it)."""
         return self.hot_standby and self.discovery.standby_of(phone_id) == pairing.STANDBY_HOT
 
-    def hot_phones(self) -> list[tuple[str, str]]:
-        return [(pid, ip) for pid, ip in self.discovery.get_available_phones() if self.is_hot(pid)]
+    def battery_low(self, phone_id: str) -> bool:
+        """The phone announces it runs on battery below its minimum."""
+        state = self.discovery.state_of(phone_id)
+        return state is not None and state.battery_low
+
+    def must_not_carry(self, phone_id: str) -> bool:
+        """Low on battery, and its owner doesn't allow it to carry an outage like that."""
+        state = self.discovery.state_of(phone_id)
+        return state is not None and state.battery_low and not state.last_resort
+
+    def reports_low_battery(self, status: dict) -> bool:
+        """Same as battery_low, from the phone's signed status."""
+        battery, plugged, minimum = status.get("battery"), status.get("plugged"), status.get("min_battery")
+        return pairing.valid_battery(battery) and pairing.valid_battery(minimum) and plugged is False and battery < minimum
+
+    def rank(self, phone_id: str) -> tuple:
+        """Sort key: best phone first (see the class docstring)."""
+        state = self.discovery.state_of(phone_id)
+        battery, plugged = (state.battery, state.plugged) if state else (0, False)
+        return (self.battery_low(phone_id), not self.is_hot(phone_id), not plugged, -battery)
+
+    def ranked_phones(self) -> list[tuple[str, str]]:
+        """Phones that may carry an outage, best first."""
+        phones = [(pid, ip) for pid, ip in self.discovery.get_available_phones() if not self.must_not_carry(pid)]
+        return sorted(phones, key=lambda c: self.rank(c[0]))
+
+    def standby_phones(self) -> list[tuple[str, str]]:
+        """Phones a hot standby tunnel may use: offering it, and not low on battery."""
+        return [(pid, ip) for pid, ip in self.ranked_phones() if self.is_hot(pid) and not self.battery_low(pid)]
 
     def activate(self, avoid: str | None = None, prefer: str | None = None, standby: bool = False) -> bool:
         """
-        Starts failover on the first available phone that succeeds. [avoid] (a phone just lost)
-        is tried last, [prefer] first (phone IDs), then phones offering hot standby, which keep
-        their cellular up anyway. With [standby] (no outage), only those are used.
+        Starts failover on the best available phone that succeeds. [avoid] (a phone just lost)
+        is tried last, [prefer] first (phone IDs). With [standby] (no outage), only phones
+        offering hot standby are used, and not on low battery.
         """
-        candidates = self.hot_phones() if standby else self.discovery.get_available_phones()
-        candidates.sort(key=lambda c: 0 if c[0] == prefer else 3 if c[0] == avoid else 1 if self.is_hot(c[0]) else 2)
+        candidates = self.standby_phones() if standby else self.ranked_phones()
+        # Stable sort: keeps the ranking between the others
+        candidates.sort(key=lambda c: 0 if c[0] == prefer else 2 if c[0] == avoid else 1)
         if not candidates:
             if not standby:
                 logger.error("Cannot activate failover: no paired smartphone available")
@@ -545,7 +651,8 @@ class FailoverCoordinator:
         for phone_id, ip in candidates:
             label = self.label(phone_id, ip)
             try:
-                activate_failover(self.client(phone_id, ip), self.routing, standby=standby)
+                config = start_phone_relay(self.client(phone_id, ip), standby=standby)
+                bring_up_tunnel(self.routing, config)
             except StandbyDeclined as e:
                 # Its announcement was stale: nothing was started
                 logger.info(f"Smartphone {label}: {e}")
@@ -561,22 +668,31 @@ class FailoverCoordinator:
                 self._teardown_local()
                 self.release_phone(phone_id, ip)
                 continue
-            self.active_phone = (phone_id, ip)
-            self.tunnel_failures = 0
+            self._set_active(phone_id, ip, config)
             self.carrying = not standby
-            self.standby_confirmed_at = time.monotonic()
             if standby:
                 logger.info(f"Hot standby active via smartphone {label}: the router sees WAN 2 online")
             else:
                 logger.info(f"Failover active via smartphone {label}")
+            if self.battery_low(phone_id):
+                logger.warning(f"Smartphone {label} is low on battery: no other smartphone could take the failover")
             return True
         return False
+
+    def _set_active(self, phone_id: str, ip: str, config: str):
+        self.active_phone = (phone_id, ip)
+        self.active_config = config
+        self.tunnel_failures = 0
+        self.standby_confirmed_at = time.monotonic()
+        self.switch_check_at = 0.0
+        self.low_battery_reported = False
 
     def deactivate(self):
         self._teardown_local()
         if self.active_phone:
             self.release_phone(*self.active_phone)
         self.active_phone = None
+        self.active_config = None
         self.tunnel_failures = 0
         self.carrying = False
 
@@ -585,7 +701,7 @@ class FailoverCoordinator:
         now = time.monotonic() if now is None else now
         if not self.hot_standby:
             return False
-        hot = {pid for pid, _ in self.hot_phones()}
+        hot = {pid for pid, _ in self.standby_phones()}
         # A phone that left (or stopped offering it) and comes back starts afresh
         self.standby_failed_phones &= hot
         if not hot or (now < self.standby_retry_at and hot <= self.standby_failed_phones):
@@ -605,22 +721,158 @@ class FailoverCoordinator:
 
     def standby_still_offered(self, now: float | None = None, force: bool = False) -> bool:
         """
-        Whether the active phone still offers hot standby: its announcement must say so (a
-        "cold" one ends it right away), and its signed status confirms it every
-        [standby_confirm_interval], so a replayed "hot" broadcast can't keep the tunnel up.
+        Whether the active phone still offers hot standby, and isn't low on battery: its
+        announcement must say so (a "cold" one ends it right away), and its signed status
+        confirms it every [standby_confirm_interval], so a replayed "hot" broadcast can't
+        keep the tunnel up.
         """
         if not self.active_phone or not self.is_hot(self.active_phone[0]):
+            return False
+        if self.battery_low(self.active_phone[0]):
+            state = self.discovery.state_of(self.active_phone[0])
+            logger.info(f"Smartphone {self.active_phone_label} is low on battery ({state.battery}%, its minimum is {state.min_battery}%)")
             return False
         now = time.monotonic() if now is None else now
         if not force and now - self.standby_confirmed_at < self.standby_confirm_interval:
             return True
         self.standby_confirmed_at = now
         try:
-            return self.client(*self.active_phone).get_status().get("standby") == pairing.STANDBY_HOT
+            status = self.client(*self.active_phone).get_status()
         except Exception as e:
             # Unreachable over HTTP: the tunnel probes decide whether the phone is lost
             logger.debug(f"Standby confirmation from {self.active_phone_label} failed: {e}")
             return True
+        return status.get("standby") == pairing.STANDBY_HOT and not self.reports_low_battery(status)
+
+    def switch_target(self, now: float) -> tuple[str, str, bool] | None:
+        """
+        A better phone to carry the outage: (phone_id, ip, offers hot standby), or None.
+        Worth a switch (which resets every connection: new cellular public IP) only when
+          - the active phone is low on battery, for a phone plugged in or with enough battery
+            (any phone not low if the active one isn't allowed to carry an outage like that);
+          - the active phone doesn't offer hot standby, for one that does (and isn't low).
+        The new phone must have announced the same thing for [switch_stable_after].
+        """
+        active_id = self.active_phone[0]
+        if self.discovery.state_of(active_id) is None:
+            # Not heard: the tunnel probes decide whether it's lost
+            return None
+        active_low, active_hot = self.battery_low(active_id), self.is_hot(active_id)
+        must_leave = self.must_not_carry(active_id)
+        if not active_low and active_hot:
+            return None
+        available = {pid for pid, _ in self.discovery.get_available_phones()}
+        self.switch_backoff = {pid: b for pid, b in self.switch_backoff.items() if pid in available}
+        for phone_id, ip in self.ranked_phones():
+            state = self.discovery.state_of(phone_id)
+            if phone_id == active_id or state is None or now - state.since < self.switch_stable_after:
+                continue
+            if phone_id in self.switch_backoff and now < self.switch_backoff[phone_id][0]:
+                continue
+            hot = self.is_hot(phone_id)
+            if must_leave and not state.battery_low:
+                return phone_id, ip, hot
+            if active_low and (state.plugged or state.battery >= state.min_battery + self.switch_battery_margin):
+                return phone_id, ip, hot
+            if not active_hot and hot and not self.battery_low(phone_id):
+                return phone_id, ip, True
+        if active_low and not must_leave and not self.low_battery_reported:
+            self.low_battery_reported = True
+            logger.warning(f"Smartphone {self.active_phone_label} is low on battery, and no other smartphone can take over yet")
+        return None
+
+    def maybe_switch(self, now: float | None = None) -> bool:
+        """
+        During an outage: moves the failover to a better phone (see switch_target). A phone
+        low on battery whose owner doesn't allow it to carry an outage like that is released
+        even when no other phone can take over. True if the active phone changed or was released.
+        """
+        now = time.monotonic() if now is None else now
+        if not self.active_phone or now < self.switch_check_at:
+            return False
+        target = self.switch_target(now)
+        must_leave = self.must_not_carry(self.active_phone[0])
+        if target is None and not must_leave:
+            return False
+        # Moving to hot standby: the new phone's signed status must confirm it offers it
+        to_hot = target is not None and target[2] and not self.is_hot(self.active_phone[0])
+        if not to_hot:
+            # Only a low battery justifies this one: the active phone itself must confirm it
+            try:
+                status = self.client(*self.active_phone).get_status()
+            except Exception as e:
+                logger.debug(f"Battery confirmation from {self.active_phone_label} failed: {e}")
+                status = None
+            confirmed = status is not None and self.reports_low_battery(status)
+            if confirmed and target is None:
+                confirmed = status.get("last_resort") is False
+            if not confirmed:
+                self.switch_check_at = now + self.standby_confirm_interval
+                return False
+        if target is None:
+            logger.warning(
+                f"Smartphone {self.active_phone_label} is below its minimum battery and may not carry an outage like that: "
+                "releasing it (no other smartphone can take over)"
+            )
+            self.deactivate()
+            return True
+        phone_id, ip, _ = target
+        return self.switch_to(phone_id, ip, to_hot, now)
+
+    def switch_to(self, phone_id: str, ip: str, hot: bool = False, now: float | None = None) -> bool:
+        """
+        Planned handover, make-before-break: start the new phone's relay (cellular is the slow
+        part) while the current one keeps carrying, swap wg0, check the new tunnel, then
+        release the old phone. If anything fails, the current phone keeps (or gets back) the
+        tunnel and the new one is retried later (backoff).
+        """
+        now = time.monotonic() if now is None else now
+        old_phone, old_config = self.active_phone, self.active_config
+        label = self.label(phone_id, ip)
+        logger.info(f"Moving failover from smartphone {self.active_phone_label} to {label}...")
+        try:
+            config = start_phone_relay(self.client(phone_id, ip), standby=hot)
+        except (StandbyDeclined, PhoneRequestError) as e:
+            logger.warning(f"Smartphone {label} can't take over: {e}")
+            self._switch_failed(phone_id, now)
+            return False
+        except Exception as e:
+            logger.warning(f"Smartphone {label} could not start its relay: {e}")
+            self.release_phone(phone_id, ip)
+            self._switch_failed(phone_id, now)
+            return False
+
+        try:
+            bring_up_tunnel(self.routing, config)
+            ok = any(
+                check_tunnel_canary(self.wg_iface, self.canary_ip, timeout=self.ping_timeout)
+                for _ in range(self.switch_probe_attempts)
+            )
+        except Exception as e:
+            logger.warning(f"Tunnel to smartphone {label} failed: {e}")
+            ok = False
+        if not ok:
+            logger.warning(f"Smartphone {label} did not answer through the tunnel: back to {self.active_phone_label}")
+            try:
+                # Its relay still runs with the previous key
+                bring_up_tunnel(self.routing, old_config)
+            except Exception as e:
+                # The tunnel probes will hand the failover over
+                logger.error(f"Could not restore the tunnel to smartphone {self.active_phone_label}: {e}")
+            self.release_phone(phone_id, ip)
+            self._switch_failed(phone_id, now)
+            return False
+
+        self.release_phone(*old_phone)
+        self._set_active(phone_id, ip, config)
+        self.switch_backoff.pop(phone_id, None)
+        logger.info(f"Failover moved to smartphone {label}")
+        return True
+
+    def _switch_failed(self, phone_id: str, now: float):
+        _, delay = self.switch_backoff.get(phone_id, (0.0, self.standby_retry_min))
+        self.switch_backoff[phone_id] = (now + delay, min(delay * 2, self.standby_retry_max))
+        logger.info(f"Next attempt with smartphone {phone_id} in {delay:.0f}s at the earliest")
 
     def tunnel_lost(self) -> bool:
         """
@@ -653,6 +905,8 @@ class FailoverLoop:
       - hot standby: tunnel up, the router still uses WAN 1 (but sees WAN 2 online);
       - carrying: the router uses WAN 2 (the canary from the primary interface answers).
     After an outage, a phone still offering hot standby keeps its tunnel; others are released.
+    While carrying, the failover moves to a better phone when one is worth it (see
+    FailoverCoordinator.switch_target).
     """
 
     def __init__(self, coordinator: "FailoverCoordinator", args: argparse.Namespace):
@@ -713,6 +967,14 @@ class FailoverLoop:
         if check_tunnel_canary(args.primary_iface, args.canary_ip, timeout=args.ping_timeout):
             coordinator.carrying = True
             self.success_probes = 0
+            if coordinator.maybe_switch():
+                self.active_state = None
+                if coordinator.active:
+                    logger.info(f">>> Failover moved to smartphone {coordinator.active_phone_label}. <<<")
+                else:
+                    # Back to idle: retried on the next failed WAN 1 probe if a phone shows up
+                    self.failed_probes = max(args.fail_threshold - 1, 0)
+                return
             self._report(
                 "wan2",
                 f"WAN 2 active: LAN traffic routed via backup cellular ({args.failover_iface}). "
@@ -725,7 +987,7 @@ class FailoverLoop:
             if coordinator.standby_still_offered():
                 self._report("standby", f"Hot standby via smartphone {coordinator.active_phone_label}: WAN 2 ready")
             else:
-                logger.info(f"Smartphone {coordinator.active_phone_label} no longer offers hot standby: releasing it")
+                logger.info(f"Hot standby via smartphone {coordinator.active_phone_label} ended: releasing it")
                 self.active_state = None
                 coordinator.deactivate()
             return
@@ -956,13 +1218,15 @@ def list_phones(store: "pairing.PairingStore", discovery: "PhoneDiscovery"):
         return
     # Phones broadcast every 5s
     time.sleep(6)
-    online = dict(discovery.get_available_phones())
-    print(f"{'NAME':<28} {'WI-FI':<20} {'PAIRED':<17} {'STATUS':<22} {'STANDBY':<8} ID")
+    print(f"{'NAME':<28} {'WI-FI':<20} {'PAIRED':<17} {'STATUS':<22} {'STANDBY':<8} {'BATTERY':<16} {'MINIMUM':<20} ID")
     for p in phones:
         paired = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.paired_at)) if p.paired_at else "?"
-        status = f"online ({online[p.id]})" if p.id in online else "not seen"
-        standby = discovery.standby_of(p.id) if p.id in online else "-"
-        print(f"{p.label:<28} {p.ssid:<20} {paired:<17} {status:<22} {standby:<8} {p.id}")
+        state = discovery.state_of(p.id)
+        status = f"online ({state.ip})" if state else "not seen"
+        standby = state.standby if state else "-"
+        battery = format_battery(state.battery, state.plugged) if state else "-"
+        minimum = f"{state.min_battery}%{' (last resort)' if state.last_resort else ''}" if state else "-"
+        print(f"{p.label:<28} {p.ssid:<20} {paired:<17} {status:<22} {standby:<8} {battery:<16} {minimum:<20} {p.id}")
 
 
 def main():
