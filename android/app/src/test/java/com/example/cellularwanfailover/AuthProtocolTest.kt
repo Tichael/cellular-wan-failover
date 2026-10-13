@@ -38,16 +38,10 @@ class AuthProtocolTest {
 
     @Test
     fun discoverySignature() {
-        val fields = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23")
-        assertEquals("_BT36DkjoiviLRKqYY75UWrC-xtB5Z4ITgCPfnrqLCA", signer.sign(fields))
-    }
-
-    @Test
-    fun standbySignature() {
-        val hot = AuthProtocol.standbyFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "hot")
-        assertEquals("PDrQViMezitweHA66b69nGsEiiB6HA48ruIfRmOlQzE", signer.sign(hot))
-        val cold = AuthProtocol.standbyFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "cold")
-        assertEquals("z0eXs04TbUrEUcVWnnlAaUBHn9jd1qKrE24r73pZYQk", signer.sign(cold))
+        val cold = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "cold")
+        assertEquals("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs", signer.sign(cold))
+        val hot = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "hot")
+        assertEquals("nHAaCXKjpBSE27oH7pAXu6-cZu6zq0rgfHcQUg7P_xc", signer.sign(hot))
     }
 
     @Test
@@ -68,12 +62,12 @@ class AuthProtocolTest {
 
     @Test
     fun verifyRejectsWrongOrMissingSignatures() {
-        val fields = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23")
-        assertTrue(signer.verify("_BT36DkjoiviLRKqYY75UWrC-xtB5Z4ITgCPfnrqLCA", fields))
-        assertFalse(signer.verify("_BT36DkjoiviLRKqYY75UWrC-xtB5Z4ITgCPfnrqLCB", fields))
+        val fields = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "cold")
+        assertTrue(signer.verify("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs", fields))
+        assertFalse(signer.verify("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGt", fields))
         assertFalse(signer.verify(null, fields))
         assertFalse(signer.verify("", fields))
-        assertFalse(memorySigner(ByteArray(32)).verify("_BT36DkjoiviLRKqYY75UWrC-xtB5Z4ITgCPfnrqLCA", fields))
+        assertFalse(memorySigner(ByteArray(32)).verify("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs", fields))
     }
 
     @Test

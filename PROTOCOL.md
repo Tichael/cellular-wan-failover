@@ -29,8 +29,7 @@ All binary values are written as base64url without padding. Signatures are `base
 |---|---|
 | Request | `wf1-req`, gateway_id, phone_id, METHOD, path, challenge, nonce, hex(sha256(body)) |
 | Response | `wf1-resp`, gateway_id, phone_id, nonce, HTTP status, hex(sha256(body)) |
-| Discovery | `wf1-disc`, gateway_id, phone_id, phone Wi-Fi IPv4 |
-| Standby | `wf1-standby`, gateway_id, phone_id, phone Wi-Fi IPv4, `hot` or `cold` |
+| Discovery | `wf1-disc`, gateway_id, phone_id, phone Wi-Fi IPv4, standby (`hot` or `cold`) |
 | Replace | `wf1-replace`, gateway_id, old phone_id, new phone_id |
 | Pairing code | `wf1-code`, gateway_id, phone_id |
 
@@ -69,10 +68,10 @@ in /config/pairing.json under its name
 ## Discovery (UDP broadcast, port 8990, every 5 s)
 
 ```json
-{"service": "wan-failover", "v": 1, "pairings": [{"gw": "<gateway_id>", "pid": "<phone_id>", "sig": "<Discovery signature>", "standby": "hot", "standby_sig": "<Standby signature>"}]}
+{"service": "wan-failover", "v": 1, "pairings": [{"gw": "<gateway_id>", "pid": "<phone_id>", "standby": "hot", "sig": "<Discovery signature>"}]}
 ```
 
-`standby` says whether the phone offers hot standby (an always-on tunnel; see the README). It has its own signature so that gateways and phones that predate it ignore it. A missing, unknown or badly signed value counts as `cold`, and the pending pairing has none. The gateway uses it only as a hint: before starting or keeping a hot standby tunnel, it confirms it with the signed `/v1/status`. A replayed `hot` beacon therefore can't keep the tunnel up for more than about a minute, and a forged `cold` one only makes the gateway release the phone.
+`standby` says whether the phone offers hot standby (an always-on tunnel; see the README); the pending pairing is always `cold`. An entry without a valid `standby` is ignored. The gateway uses it only as a hint: before starting or keeping a hot standby tunnel, it confirms it with the signed `/v1/status`. A replayed `hot` beacon therefore can't keep the tunnel up for more than about a minute, and a replayed `cold` one only makes the gateway release the phone.
 
 The packet contains one entry per gateway paired on the current Wi-Fi network, plus the pending pairing if there is one. A gateway uses only its own entry, and only if the signature matches the packet's source address. Discovery only tells the gateway where the phone is. A replayed packet from another address is rejected, and a forged source address only points the gateway at the real phone. The signed HTTP exchange below is what actually protects the phone.
 

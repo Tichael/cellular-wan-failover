@@ -174,20 +174,14 @@ class PhoneDiscovery:
             if not isinstance(entry, dict) or entry.get("gw") != self.gateway_id:
                 continue
             phone_id = entry.get("pid")
+            standby = entry.get("standby")
+            if standby not in (pairing.STANDBY_HOT, pairing.STANDBY_COLD):
+                continue
             key = self.key_for(phone_id) if isinstance(phone_id, str) else None
-            if key and pairing.verify(key, entry.get("sig"), pairing.discovery_fields(self.gateway_id, phone_id, ip)):
-                self.record_phone(phone_id, ip, now, standby=self._standby(entry, key, phone_id, ip))
+            if key and pairing.verify(key, entry.get("sig"), pairing.discovery_fields(self.gateway_id, phone_id, ip, standby)):
+                self.record_phone(phone_id, ip, now, standby=standby)
                 proven.append(phone_id)
         return proven
-
-    def _standby(self, entry: dict, key: bytes, phone_id: str, ip: str) -> str:
-        """The phone's signed standby; cold when missing (older app) or not signed."""
-        standby = entry.get("standby")
-        if standby in (pairing.STANDBY_HOT, pairing.STANDBY_COLD) and pairing.verify(
-            key, entry.get("standby_sig"), pairing.standby_fields(self.gateway_id, phone_id, ip, standby)
-        ):
-            return standby
-        return pairing.STANDBY_COLD
 
     def record_phone(self, phone_id: str, ip: str, now: float | None = None, standby: str = pairing.STANDBY_COLD):
         now = time.monotonic() if now is None else now
@@ -493,6 +487,8 @@ class FailoverCoordinator:
         self.standby_retry_max = standby_retry_max
         self.standby_retry_delay = standby_retry_min
         self.standby_retry_at = 0.0
+        # Hot phones that were available when the last attempt failed: the backoff applies to them
+        self.standby_failed_phones: set[str] = set()
 
     @property
     def active(self) -> bool:
@@ -587,13 +583,22 @@ class FailoverCoordinator:
     def try_standby(self, now: float | None = None) -> bool:
         """Brings up a hot standby tunnel if a phone offers one; failures back off (30 s → 5 min)."""
         now = time.monotonic() if now is None else now
-        if not self.hot_standby or now < self.standby_retry_at or not self.hot_phones():
+        if not self.hot_standby:
+            return False
+        hot = {pid for pid, _ in self.hot_phones()}
+        # A phone that left (or stopped offering it) and comes back starts afresh
+        self.standby_failed_phones &= hot
+        if not hot or (now < self.standby_retry_at and hot <= self.standby_failed_phones):
             return False
         if self.activate(standby=True):
             self.standby_retry_delay = self.standby_retry_min
             self.standby_retry_at = 0.0
+            self.standby_failed_phones = set()
             return True
+        if not hot <= self.standby_failed_phones:
+            self.standby_retry_delay = self.standby_retry_min
         logger.warning(f"Hot standby could not start; retrying in {self.standby_retry_delay:.0f}s")
+        self.standby_failed_phones = hot
         self.standby_retry_at = now + self.standby_retry_delay
         self.standby_retry_delay = min(self.standby_retry_delay * 2, self.standby_retry_max)
         return False

@@ -54,10 +54,9 @@ data class PairCompleteResponse(val name: String, val ssid: String, val replaces
 data class DiscoveryEntry(
     val gw: String,
     val pid: String,
-    val sig: String,
     /** "hot" while the phone offers an always-on tunnel, "cold" (on demand) otherwise */
-    val standby: String? = null,
-    val standby_sig: String? = null
+    val standby: String,
+    val sig: String
 )
 
 @Serializable
@@ -241,19 +240,16 @@ class GatewayAuthenticator(
         for (pairing in repository.pairings.value) {
             if (pairing.ssid != currentSsid) continue
             val signer = repository.signer(pairing) ?: continue
-            entries += discoveryEntry(pairing.gatewayId, pairing.phoneId, wifiIp, signer).copy(
-                standby = standby,
-                standby_sig = signer.sign(AuthProtocol.standbyFields(pairing.gatewayId, pairing.phoneId, wifiIp, standby))
-            )
+            entries += discoveryEntry(pairing.gatewayId, pairing.phoneId, wifiIp, standby, signer)
         }
-        // A pending pairing can't serve yet: no standby
+        // A pending pairing can't serve yet
         pending?.takeIf { it.ssid == currentSsid }?.let {
-            entries += discoveryEntry(it.invite.gatewayId, it.invite.phoneId, wifiIp, it.signer)
+            entries += discoveryEntry(it.invite.gatewayId, it.invite.phoneId, wifiIp, AuthProtocol.STANDBY_COLD, it.signer)
         }
         if (entries.isEmpty()) return null
         return json.encodeToString(DiscoveryPayload(pairings = entries)).toByteArray(Charsets.UTF_8)
     }
 
-    private fun discoveryEntry(gatewayId: String, phoneId: String, wifiIp: String, signer: MessageSigner) =
-        DiscoveryEntry(gatewayId, phoneId, signer.sign(AuthProtocol.discoveryFields(gatewayId, phoneId, wifiIp)))
+    private fun discoveryEntry(gatewayId: String, phoneId: String, wifiIp: String, standby: String, signer: MessageSigner) =
+        DiscoveryEntry(gatewayId, phoneId, standby, signer.sign(AuthProtocol.discoveryFields(gatewayId, phoneId, wifiIp, standby)))
 }

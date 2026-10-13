@@ -282,9 +282,8 @@ class GatewayAuthenticatorTest {
         val entry = payload.pairings.single()
         assertEquals(gateway.gatewayId, entry.gw)
         assertEquals(gateway.phoneId, entry.pid)
-        assertTrue(gateway.signer.verify(entry.sig, AuthProtocol.discoveryFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23")))
         assertEquals("cold", entry.standby)
-        assertTrue(gateway.signer.verify(entry.standby_sig, AuthProtocol.standbyFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "cold")))
+        assertTrue(gateway.signer.verify(entry.sig, AuthProtocol.discoveryFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "cold")))
     }
 
     @Test
@@ -293,7 +292,7 @@ class GatewayAuthenticatorTest {
         val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23", "hot")!!.toString(Charsets.UTF_8))
         val entry = payload.pairings.single()
         assertEquals("hot", entry.standby)
-        assertTrue(gateway.signer.verify(entry.standby_sig, AuthProtocol.standbyFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "hot")))
+        assertTrue(gateway.signer.verify(entry.sig, AuthProtocol.discoveryFields(gateway.gatewayId, gateway.phoneId, "192.168.1.23", "hot")))
     }
 
     @Test
@@ -301,7 +300,7 @@ class GatewayAuthenticatorTest {
         auth.beginPairing(gateway.invite, "Home")
         val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "10.0.0.5")!!.toString(Charsets.UTF_8))
         assertEquals(gateway.phoneId, payload.pairings.single().pid)
-        assertNull(payload.pairings.single().standby)
+        assertEquals("cold", payload.pairings.single().standby)
     }
 
     @Test
@@ -319,6 +318,6 @@ class GatewayAuthenticatorTest {
         val vectorGateway = TestGateway(gatewayId = Vectors.GATEWAY, phoneId = Vectors.PHONE, key = Vectors.KEY)
         auth.pair(vectorGateway, "Home")
         val payload = Json.decodeFromString<DiscoveryPayload>(auth.discoveryPayload("Home", "192.168.1.23")!!.toString(Charsets.UTF_8))
-        assertEquals("_BT36DkjoiviLRKqYY75UWrC-xtB5Z4ITgCPfnrqLCA", payload.pairings.single().sig)
+        assertEquals("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs", payload.pairings.single().sig)
     }
 }

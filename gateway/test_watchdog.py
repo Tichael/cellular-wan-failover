@@ -193,12 +193,9 @@ def discovery_packet(entries) -> bytes:
     return json.dumps({"service": "wan-failover", "v": 1, "pairings": entries}).encode()
 
 
-def signed_entry(phone_id, ip, key=PHONE_KEY, gateway_id=GW_ID, standby=None):
-    entry = {"gw": gateway_id, "pid": phone_id, "sig": pairing.sign(key, pairing.discovery_fields(gateway_id, phone_id, ip))}
-    if standby:
-        entry["standby"] = standby
-        entry["standby_sig"] = pairing.sign(key, pairing.standby_fields(gateway_id, phone_id, ip, standby))
-    return entry
+def signed_entry(phone_id, ip, key=PHONE_KEY, gateway_id=GW_ID, standby="cold"):
+    sig = pairing.sign(key, pairing.discovery_fields(gateway_id, phone_id, ip, standby))
+    return {"gw": gateway_id, "pid": phone_id, "standby": standby, "sig": sig}
 
 
 class TestPhoneDiscovery:
@@ -231,28 +228,18 @@ class TestPhoneDiscovery:
         discovery.handle_packet("10.20.0.10", discovery_packet([signed_entry("phoneA", "10.20.0.10", standby="cold")]), now=105.0)
         assert discovery.standby_of("phoneA", now=106.0) == "cold"
 
-    def test_missing_standby_means_cold(self):
-        # Older app: no standby field
-        discovery = self.make()
-        discovery.handle_packet("10.20.0.10", discovery_packet([signed_entry("phoneA", "10.20.0.10")]), now=100.0)
-        assert discovery.standby_of("phoneA", now=101.0) == "cold"
-
-    @pytest.mark.parametrize("tamper", [
-        {"standby": "hot", "standby_sig": "forged"},
-        {"standby": "hot"},
-        {"standby": "lukewarm"},
-    ])
-    def test_unsigned_or_unknown_standby_means_cold(self, tamper):
-        discovery = self.make()
-        entry = signed_entry("phoneA", "10.20.0.10", standby="cold") | tamper
-        assert discovery.handle_packet("10.20.0.10", discovery_packet([entry]), now=100.0) == ["phoneA"]
-        assert discovery.standby_of("phoneA", now=101.0) == "cold"
-
-    def test_standby_signature_is_bound_to_address(self):
+    @pytest.mark.parametrize("standby", [None, "", "lukewarm", 1])
+    def test_ignores_entry_without_valid_standby(self, standby):
         discovery = self.make()
         entry = signed_entry("phoneA", "10.20.0.10")
-        entry |= {"standby": "hot", "standby_sig": signed_entry("phoneA", "10.20.0.99", standby="hot")["standby_sig"]}
-        discovery.handle_packet("10.20.0.10", discovery_packet([entry]), now=100.0)
+        entry["standby"] = standby
+        assert discovery.handle_packet("10.20.0.10", discovery_packet([entry]), now=100.0) == []
+
+    def test_standby_is_covered_by_the_signature(self):
+        # Flipping "cold" to "hot" breaks the signature: the entry is ignored
+        discovery = self.make()
+        entry = signed_entry("phoneA", "10.20.0.10", standby="cold") | {"standby": "hot"}
+        assert discovery.handle_packet("10.20.0.10", discovery_packet([entry]), now=100.0) == []
         assert discovery.standby_of("phoneA", now=101.0) == "cold"
 
     def test_picks_own_entry_among_other_gateways(self):
@@ -959,3 +946,29 @@ class TestHotStandby:
         self.failing.clear()
         assert coordinator.try_standby(now=coordinator.standby_retry_at) is True
         assert coordinator.standby_retry_delay == 30.0
+
+    def test_phone_leaving_and_coming_back(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        # Out of Wi-Fi range: no more beacons, the tunnel stops answering
+        self.discovery.phones, self.tunnel_ok = [], False
+        self.steps(3)
+        assert coordinator.active is False
+        self.steps(10)
+        assert self.activations == [("phoneA", True)]
+        # Back home
+        self.discovery.phones, self.tunnel_ok = [self.A], True
+        self.steps()
+        assert coordinator.active_phone == self.A
+        assert self.activations == [("phoneA", True), ("phoneA", True)]
+
+    def test_phone_coming_back_skips_backoff_from_before_it_left(self):
+        coordinator = self.make([self.A], hot={"phoneA"}, failing={"phoneA"})
+        # Still heard for a few seconds after leaving: the attempt fails and backs off
+        assert coordinator.try_standby(now=1000.0) is False
+        self.discovery.phones = []
+        assert coordinator.try_standby(now=1005.0) is False
+        # Back (with a working relay) before the backoff ends: retried right away
+        self.discovery.phones = [self.A]
+        self.failing.clear()
+        assert coordinator.try_standby(now=1010.0) is True
