@@ -11,10 +11,12 @@ import pytest
 from watchdog import (
     AndroidFailoverClient,
     FailoverCoordinator,
+    FailoverLoop,
     PhoneAuthError,
     PhoneDiscovery,
     PhoneRequestError,
     RoutingManager,
+    StandbyDeclined,
     activate_failover,
     manual_stop,
     build_wg_config,
@@ -191,8 +193,9 @@ def discovery_packet(entries) -> bytes:
     return json.dumps({"service": "wan-failover", "v": 1, "pairings": entries}).encode()
 
 
-def signed_entry(phone_id, ip, key=PHONE_KEY, gateway_id=GW_ID):
-    return {"gw": gateway_id, "pid": phone_id, "sig": pairing.sign(key, pairing.discovery_fields(gateway_id, phone_id, ip))}
+def signed_entry(phone_id, ip, key=PHONE_KEY, gateway_id=GW_ID, standby="cold"):
+    sig = pairing.sign(key, pairing.discovery_fields(gateway_id, phone_id, ip, standby))
+    return {"gw": gateway_id, "pid": phone_id, "standby": standby, "sig": sig}
 
 
 class TestPhoneDiscovery:
@@ -211,6 +214,33 @@ class TestPhoneDiscovery:
         discovery = self.make()
         assert discovery.handle_packet("10.20.0.10", discovery_packet([signed_entry("phoneA", "10.20.0.10")]), now=100.0) == ["phoneA"]
         assert discovery.get_available_phones(now=101.0) == [("phoneA", "10.20.0.10")]
+
+    def test_records_signed_hot_standby(self):
+        discovery = self.make()
+        discovery.handle_packet("10.20.0.10", discovery_packet([signed_entry("phoneA", "10.20.0.10", standby="hot")]), now=100.0)
+        assert discovery.standby_of("phoneA", now=101.0) == "hot"
+        # A silent phone offers nothing
+        assert discovery.standby_of("phoneA", now=200.0) == "cold"
+
+    def test_standby_switches_back_to_cold(self):
+        discovery = self.make()
+        discovery.handle_packet("10.20.0.10", discovery_packet([signed_entry("phoneA", "10.20.0.10", standby="hot")]), now=100.0)
+        discovery.handle_packet("10.20.0.10", discovery_packet([signed_entry("phoneA", "10.20.0.10", standby="cold")]), now=105.0)
+        assert discovery.standby_of("phoneA", now=106.0) == "cold"
+
+    @pytest.mark.parametrize("standby", [None, "", "lukewarm", 1])
+    def test_ignores_entry_without_valid_standby(self, standby):
+        discovery = self.make()
+        entry = signed_entry("phoneA", "10.20.0.10")
+        entry["standby"] = standby
+        assert discovery.handle_packet("10.20.0.10", discovery_packet([entry]), now=100.0) == []
+
+    def test_standby_is_covered_by_the_signature(self):
+        # Flipping "cold" to "hot" breaks the signature: the entry is ignored
+        discovery = self.make()
+        entry = signed_entry("phoneA", "10.20.0.10", standby="cold") | {"standby": "hot"}
+        assert discovery.handle_packet("10.20.0.10", discovery_packet([entry]), now=100.0) == []
+        assert discovery.standby_of("phoneA", now=101.0) == "cold"
 
     def test_picks_own_entry_among_other_gateways(self):
         discovery = self.make()
@@ -457,13 +487,48 @@ class TestWireGuardConfig:
         routing.setup_wireguard_interface.assert_not_called()
 
 
+@patch("watchdog.generate_wg_keypair", return_value=(KEY_A, KEY_B))
+@pytest.mark.parametrize("standby", [None, "cold"])
+def test_standby_activation_requires_signed_hot_status(_mock_keys, standby):
+    client = MagicMock()
+    client.phone_ip = "192.168.1.42"
+    client.get_status.return_value = {
+        "wireguard": {"port": 51820, "public_key": KEY_C, "peer_ip": "10.100.0.2"},
+        **({"standby": standby} if standby else {}),
+    }
+    routing = MagicMock()
+    with pytest.raises(StandbyDeclined):
+        activate_failover(client, routing, standby=True)
+    client.start_failover.assert_not_called()
+    routing.setup_wireguard_interface.assert_not_called()
+
+
+@patch("watchdog.generate_wg_keypair", return_value=(KEY_A, KEY_B))
+def test_standby_activation_with_hot_status(_mock_keys):
+    client = MagicMock()
+    client.phone_ip = "192.168.1.42"
+    client.get_status.return_value = {
+        "wireguard": {"port": 51820, "public_key": KEY_C, "peer_ip": "10.100.0.2"},
+        "standby": "hot",
+    }
+    routing = MagicMock()
+    activate_failover(client, routing, standby=True)
+    client.start_failover.assert_called_once_with(KEY_B)
+    routing.enable_routing_and_nat.assert_called_once()
+
+
 class FakeDiscovery:
-    def __init__(self, phones):
+    def __init__(self, phones, hot=()):
         self.gateway_id = GW_ID
         self.phones = list(phones)
+        # IDs of the phones announcing hot standby
+        self.hot = set(hot)
 
     def get_available_phones(self):
         return list(self.phones)
+
+    def standby_of(self, phone_id):
+        return pairing.STANDBY_HOT if phone_id in self.hot else pairing.STANDBY_COLD
 
 
 def fake_store(tmp_path, phone_ids):
@@ -487,7 +552,7 @@ class TestFailoverCoordinator:
             client.phone_id = phone_id
             return client
 
-        def fake_activate(client, routing):
+        def fake_activate(client, routing, standby=False):
             if client.phone_id in failing_phones:
                 raise ConnectionError(f"{client.phone_id} unreachable")
             if client.phone_id in refusing_phones:
@@ -674,3 +739,236 @@ class TestArgParsing:
         assert args.restore_threshold == 4
         assert args.check_interval == 3
         assert args.targets == ["9.9.9.9"]
+
+
+class TestHotStandby:
+    """FailoverLoop state machine: idle / hot standby / carrying (see FailoverLoop)."""
+
+    A = ("phoneA", "10.20.0.10")
+    B = ("phoneB", "10.20.0.11")
+
+    @pytest.fixture(autouse=True)
+    def _setup(self, tmp_path):
+        self.tmp_path = tmp_path
+        # Probe results, changed by the tests
+        self.wan1_ok = True
+        self.router_on_wan2 = False
+        self.tunnel_ok = True
+        self.activations = []
+        patches = [
+            patch("watchdog.check_primary_wan", side_effect=lambda *a, **k: self.wan1_ok),
+            patch("watchdog.check_tunnel_canary", side_effect=self._canary),
+            patch("watchdog.activate_failover", side_effect=self._activate),
+        ]
+        for p in patches:
+            p.start()
+        yield
+        for p in patches:
+            p.stop()
+
+    def _canary(self, iface, canary_ip, timeout=2):
+        # Through wg0: the phone answers; from the primary interface: only if the router uses WAN 2
+        return self.tunnel_ok if iface == "wg0" else self.router_on_wan2
+
+    def _activate(self, client, routing, standby=False):
+        if client.phone_id in self.failing:
+            raise ConnectionError("unreachable")
+        if standby and client.get_status().get("standby") != "hot":
+            raise StandbyDeclined("not hot")
+        self.activations.append((client.phone_id, standby))
+        return {"result": "active"}
+
+    def make(self, phones, hot=(), hot_standby=True, failing=()):
+        self.failing = set(failing)
+        self.clients = {}
+
+        def factory(phone_ip, phone_id, key, gateway_id, http_port):
+            client = self.clients.get(phone_id)
+            if client is None:
+                client = self.clients[phone_id] = MagicMock(name=phone_id)
+                # The signed status agrees with the announcement unless a test says otherwise
+                client.get_status.side_effect = lambda pid=phone_id: {"standby": self.discovery.standby_of(pid)}
+            client.phone_ip, client.phone_id = phone_ip, phone_id
+            return client
+
+        self.discovery = FakeDiscovery(phones, hot=hot)
+        self.routing = MagicMock()
+        self.coordinator = FailoverCoordinator(
+            discovery=self.discovery,
+            routing=self.routing,
+            store=fake_store(self.tmp_path, [pid for pid, _ in phones]),
+            tunnel_fail_threshold=3,
+            client_factory=factory,
+            hot_standby=hot_standby,
+        )
+        args = parse_args([])
+        args.fail_threshold, args.restore_threshold = 3, 5
+        self.loop = FailoverLoop(self.coordinator, args)
+        return self.coordinator
+
+    def steps(self, n=1):
+        for _ in range(n):
+            self.loop.step()
+
+    def test_hot_phone_gets_a_tunnel_without_outage(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        assert coordinator.active_phone == self.A
+        assert coordinator.carrying is False
+        assert self.activations == [("phoneA", True)]
+
+    def test_cold_phone_waits_for_an_outage(self):
+        coordinator = self.make([self.A])
+        self.steps(5)
+        assert coordinator.active is False
+        self.wan1_ok = False
+        self.steps(3)
+        assert coordinator.active_phone == self.A
+        assert coordinator.carrying is True
+
+    def test_gateway_can_disable_hot_standby(self):
+        coordinator = self.make([self.A], hot={"phoneA"}, hot_standby=False)
+        self.steps(5)
+        assert coordinator.active is False
+
+    def test_standby_prefers_hot_phone(self):
+        coordinator = self.make([self.A, self.B], hot={"phoneB"})
+        self.steps()
+        assert coordinator.active_phone == self.B
+
+    def test_outage_prefers_hot_phone(self):
+        # WAN 1 down from the start: the outage path activates, not hot standby
+        coordinator = self.make([self.A, self.B], hot={"phoneB"})
+        self.wan1_ok = False
+        self.steps(3)
+        assert coordinator.active_phone == self.B
+        assert coordinator.carrying is True
+
+    def test_standby_starts_carrying_when_router_switches(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        self.wan1_ok, self.router_on_wan2 = False, True
+        self.steps()
+        assert coordinator.carrying is True
+        # No new activation: re-keying the relay would cut the traffic it carries
+        assert self.activations == [("phoneA", True)]
+
+    def test_unplugged_phone_is_released_in_standby(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        self.discovery.hot.clear()
+        self.steps()
+        assert coordinator.active is False
+        self.clients["phoneA"].stop_failover.assert_called_once()
+
+    def test_unplugged_phone_keeps_carrying_during_outage(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        self.wan1_ok, self.router_on_wan2 = False, True
+        self.steps()
+        self.discovery.hot.clear()
+        self.steps(10)
+        assert coordinator.active_phone == self.A
+        self.clients["phoneA"].stop_failover.assert_not_called()
+
+    def test_failback_returns_hot_phone_to_standby(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        self.wan1_ok, self.router_on_wan2 = False, True
+        self.steps()
+        self.wan1_ok, self.router_on_wan2 = True, False
+        self.steps(5)
+        assert coordinator.active_phone == self.A
+        assert coordinator.carrying is False
+        self.routing.disable_routing_and_nat.assert_not_called()
+
+    def test_failback_releases_phone_that_went_cold(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        self.wan1_ok, self.router_on_wan2 = False, True
+        self.steps()
+        self.discovery.hot.clear()
+        self.wan1_ok, self.router_on_wan2 = True, False
+        self.steps(4)
+        assert coordinator.active is True
+        self.steps()
+        assert coordinator.active is False
+        self.clients["phoneA"].stop_failover.assert_called_once()
+
+    def test_signed_status_overrides_replayed_hot_broadcast(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        # Discovery still says hot (e.g. a replayed broadcast), the phone itself says cold
+        self.clients["phoneA"].get_status.side_effect = None
+        self.clients["phoneA"].get_status.return_value = {"standby": "cold"}
+        coordinator.standby_confirmed_at -= coordinator.standby_confirm_interval
+        self.steps()
+        assert coordinator.active is False
+
+    def test_standby_is_confirmed_only_periodically(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        calls = self.clients["phoneA"].get_status.call_count
+        self.steps(5)
+        assert self.clients["phoneA"].get_status.call_count == calls
+        assert coordinator.active is True
+
+    def test_released_phone_is_replaced_by_another_hot_phone(self):
+        coordinator = self.make([self.A, self.B], hot={"phoneA", "phoneB"})
+        self.steps()
+        assert coordinator.active_phone == self.A
+        self.discovery.hot.discard("phoneA")
+        self.steps(2)
+        assert coordinator.active_phone == self.B
+
+    def test_lost_standby_tunnel_is_rebuilt(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        self.tunnel_ok = False
+        self.steps(3)
+        assert coordinator.active is False
+        self.tunnel_ok = True
+        self.steps()
+        assert coordinator.active_phone == self.A
+        assert self.activations == [("phoneA", True), ("phoneA", True)]
+
+    def test_failing_standby_backs_off(self):
+        coordinator = self.make([self.A], hot={"phoneA"}, failing={"phoneA"})
+        assert coordinator.try_standby(now=1000.0) is False
+        assert coordinator.try_standby(now=1010.0) is False
+        assert coordinator.standby_retry_at == 1030.0
+        # Retries after 30 s, then 60 s, ... up to 5 min
+        coordinator.try_standby(now=1030.0)
+        assert coordinator.standby_retry_at == 1090.0
+        for _ in range(10):
+            coordinator.try_standby(now=coordinator.standby_retry_at)
+        assert coordinator.standby_retry_delay == 300.0
+        self.failing.clear()
+        assert coordinator.try_standby(now=coordinator.standby_retry_at) is True
+        assert coordinator.standby_retry_delay == 30.0
+
+    def test_phone_leaving_and_coming_back(self):
+        coordinator = self.make([self.A], hot={"phoneA"})
+        self.steps()
+        # Out of Wi-Fi range: no more beacons, the tunnel stops answering
+        self.discovery.phones, self.tunnel_ok = [], False
+        self.steps(3)
+        assert coordinator.active is False
+        self.steps(10)
+        assert self.activations == [("phoneA", True)]
+        # Back home
+        self.discovery.phones, self.tunnel_ok = [self.A], True
+        self.steps()
+        assert coordinator.active_phone == self.A
+        assert self.activations == [("phoneA", True), ("phoneA", True)]
+
+    def test_phone_coming_back_skips_backoff_from_before_it_left(self):
+        coordinator = self.make([self.A], hot={"phoneA"}, failing={"phoneA"})
+        # Still heard for a few seconds after leaving: the attempt fails and backs off
+        assert coordinator.try_standby(now=1000.0) is False
+        self.discovery.phones = []
+        assert coordinator.try_standby(now=1005.0) is False
+        # Back (with a working relay) before the backoff ends: retried right away
+        self.discovery.phones = [self.A]
+        self.failing.clear()
+        assert coordinator.try_standby(now=1010.0) is True

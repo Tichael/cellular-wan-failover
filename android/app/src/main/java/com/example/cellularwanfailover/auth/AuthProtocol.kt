@@ -24,6 +24,9 @@ object AuthProtocol {
     const val HEADER_NONCE = "X-WF-Nonce"
     const val HEADER_SIGNATURE = "X-WF-Signature"
 
+    const val STANDBY_HOT = "hot"
+    const val STANDBY_COLD = "cold"
+
     const val ID_BYTES = 16
     const val KEY_BYTES = 32
 
@@ -61,8 +64,8 @@ object AuthProtocol {
     fun responseFields(gatewayId: String, phoneId: String, nonce: String, status: Int, body: ByteArray) =
         listOf("wf1-resp", gatewayId, phoneId, nonce, status.toString(), sha256Hex(body))
 
-    fun discoveryFields(gatewayId: String, phoneId: String, phoneIp: String) =
-        listOf("wf1-disc", gatewayId, phoneId, phoneIp)
+    fun discoveryFields(gatewayId: String, phoneId: String, phoneIp: String, standby: String) =
+        listOf("wf1-disc", gatewayId, phoneId, phoneIp, standby)
 
     fun replaceFields(gatewayId: String, oldPhoneId: String, newPhoneId: String) =
         listOf("wf1-replace", gatewayId, oldPhoneId, newPhoneId)

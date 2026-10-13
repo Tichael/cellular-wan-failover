@@ -19,6 +19,16 @@ class WireGuardManager(private val context: Context) {
         const val LISTEN_PORT = 51820
         const val TUNNEL_PHONE_IP = "10.100.0.1"
         const val TUNNEL_PI_IP = "10.100.0.2"
+
+        /**
+         * A gateway keeps its tunnel alive (PersistentKeepalive 25 s), so WireGuard renews the
+         * handshake every 2 minutes; past this delay without one, the gateway is gone.
+         */
+        const val ORPHAN_TIMEOUT_SECONDS = 5 * 60L
+
+        /** True when the relay started at [startedAt] has had no handshake for [timeoutSeconds] (Unix seconds). */
+        fun isOrphaned(now: Long, startedAt: Long, lastHandshake: Long, timeoutSeconds: Long = ORPHAN_TIMEOUT_SECONDS): Boolean =
+            now - maxOf(startedAt, lastHandshake) > timeoutSeconds
     }
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -37,6 +47,9 @@ class WireGuardManager(private val context: Context) {
     val isRunning: Boolean get() = _isRunning.get()
 
     val bytesTransmitted = AtomicLong(0L)
+
+    // Unix seconds
+    private val startedAt = AtomicLong(0L)
 
     var onLog: ((message: String, isError: Boolean) -> Unit)? = null
 
@@ -78,6 +91,7 @@ class WireGuardManager(private val context: Context) {
             if (rc != 0) {
                 throw IllegalStateException("Failed to initialize WgRelay (exit code $rc)")
             }
+            startedAt.set(System.currentTimeMillis() / 1000)
             _isRunning.set(true)
             log("Userspace WireGuard relay started successfully (Port $LISTEN_PORT, Public Key: $phonePublicKey)")
         } catch (e: Exception) {
@@ -99,6 +113,28 @@ class WireGuardManager(private val context: Context) {
         } catch (e: Exception) {
             log("Error while stopping WireGuard relay: ${e.message}", true)
         }
+    }
+
+    /** Moves the relay's outbound connections to [netHandle] (0: no cellular network for now). */
+    fun setCellularNetwork(netHandle: Long) {
+        if (!_isRunning.get()) return
+        try {
+            WgRelay.setCellularNetwork(netHandle)
+        } catch (e: Exception) {
+            log("Failed to switch the relay's cellular network: ${e.message}", true)
+        }
+    }
+
+    /** True when the gateway hasn't renewed the tunnel for a while (crashed, unplugged...). */
+    fun isOrphaned(): Boolean {
+        if (!_isRunning.get()) return false
+        val lastHandshake = try {
+            WgRelay.getLastHandshakeEpochSeconds()
+        } catch (e: Exception) {
+            Log.d(TAG, "Failed to read the last handshake: ${e.message}")
+            return false
+        }
+        return isOrphaned(System.currentTimeMillis() / 1000, startedAt.get(), lastHandshake)
     }
 
     fun updateStatistics() {

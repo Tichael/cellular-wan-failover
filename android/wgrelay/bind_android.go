@@ -126,3 +126,23 @@ func Java_com_example_cellularwanfailover_wireguard_WgRelay_isRunning(
 	}
 	return 0
 }
+
+//export Java_com_example_cellularwanfailover_wireguard_WgRelay_setCellularNetwork
+func Java_com_example_cellularwanfailover_wireguard_WgRelay_setCellularNetwork(
+	env *C.JNIEnv,
+	cls C.jclass,
+	netHandle C.jlong,
+) C.jboolean {
+	if SetCellularNetwork(uint64(netHandle)) {
+		return 1
+	}
+	return 0
+}
+
+//export Java_com_example_cellularwanfailover_wireguard_WgRelay_getLastHandshakeEpochSeconds
+func Java_com_example_cellularwanfailover_wireguard_WgRelay_getLastHandshakeEpochSeconds(
+	env *C.JNIEnv,
+	cls C.jclass,
+) C.jlong {
+	return C.jlong(LastHandshakeUnix())
+}

@@ -37,6 +37,10 @@ class PhoneAuthError(Exception):
     """The phone rejected our signature, or its answer is not signed by the paired phone."""
 
 
+class StandbyDeclined(Exception):
+    """The phone's signed status says it doesn't offer hot standby (anymore)."""
+
+
 class PhoneRequestError(Exception):
     """The phone answered (with a valid signature) but refused the request."""
 
@@ -170,19 +174,33 @@ class PhoneDiscovery:
             if not isinstance(entry, dict) or entry.get("gw") != self.gateway_id:
                 continue
             phone_id = entry.get("pid")
+            standby = entry.get("standby")
+            if standby not in (pairing.STANDBY_HOT, pairing.STANDBY_COLD):
+                continue
             key = self.key_for(phone_id) if isinstance(phone_id, str) else None
-            if key and pairing.verify(key, entry.get("sig"), pairing.discovery_fields(self.gateway_id, phone_id, ip)):
-                self.record_phone(phone_id, ip, now)
+            if key and pairing.verify(key, entry.get("sig"), pairing.discovery_fields(self.gateway_id, phone_id, ip, standby)):
+                self.record_phone(phone_id, ip, now, standby=standby)
                 proven.append(phone_id)
         return proven
 
-    def record_phone(self, phone_id: str, ip: str, now: float | None = None):
+    def record_phone(self, phone_id: str, ip: str, now: float | None = None, standby: str = pairing.STANDBY_COLD):
         now = time.monotonic() if now is None else now
         with self._lock:
             previous = self._phones.get(phone_id)
             if previous is None or previous["ip"] != ip or now - previous["last_seen"] > self.max_age:
-                logger.info(f"[Discovery] Paired smartphone {phone_id} detected at {ip}")
-            self._phones[phone_id] = {"ip": ip, "last_seen": now}
+                logger.info(f"[Discovery] Paired smartphone {phone_id} detected at {ip} ({standby} standby)")
+            elif previous["standby"] != standby:
+                logger.info(f"[Discovery] Smartphone {phone_id} switched to {standby} standby")
+            self._phones[phone_id] = {"ip": ip, "last_seen": now, "standby": standby}
+
+    def standby_of(self, phone_id: str, now: float | None = None) -> str:
+        """Last standby announced by a phone heard within max_age (a hint: confirm it over signed HTTP)."""
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            phone = self._phones.get(phone_id)
+        if phone is None or now - phone["last_seen"] > self.max_age:
+            return pairing.STANDBY_COLD
+        return phone["standby"]
 
     def get_available_phones(self, now: float | None = None) -> list[tuple[str, str]]:
         """(phone_id, ip) of the phones heard within max_age, most recently seen first."""
@@ -391,11 +409,17 @@ def build_wg_config(private_key: str, phone_public_key: str, phone_ip: str, port
     )
 
 
-def activate_failover(client: "AndroidFailoverClient", routing: "RoutingManager") -> dict:
-    """Generates a fresh gateway key, starts the phone relay, and brings up wg0 with routing/NAT."""
+def activate_failover(client: "AndroidFailoverClient", routing: "RoutingManager", standby: bool = False) -> dict:
+    """
+    Generates a fresh gateway key, starts the phone relay, and brings up wg0 with routing/NAT.
+    With [standby] (no outage), the phone's signed status must confirm it offers hot standby:
+    discovery only hints at it.
+    """
     private_key, public_key = generate_wg_keypair()
 
     status = client.get_status()
+    if standby and status.get("standby") != pairing.STANDBY_HOT:
+        raise StandbyDeclined("Smartphone does not offer hot standby")
     wg_info = status.get("wireguard")
     if not isinstance(wg_info, dict):
         raise ValueError("Smartphone status did not include WireGuard details")
@@ -435,6 +459,10 @@ class FailoverCoordinator:
         ping_timeout: int = 2,
         tunnel_fail_threshold: int = 3,
         client_factory=None,
+        hot_standby: bool = True,
+        standby_confirm_interval: float = 60.0,
+        standby_retry_min: float = 30.0,
+        standby_retry_max: float = 300.0,
     ):
         self.discovery = discovery
         self.routing = routing
@@ -448,6 +476,19 @@ class FailoverCoordinator:
         # (phone_id, ip) of the phone carrying the failover
         self.active_phone: tuple[str, str] | None = None
         self.tunnel_failures = 0
+        # Hot standby: keep the tunnel up without an outage for phones that offer it
+        self.hot_standby = hot_standby
+        # True while the tunnel serves an outage (started by one, or the router uses WAN 2);
+        # False for a hot standby tunnel the router doesn't use
+        self.carrying = False
+        self.standby_confirm_interval = standby_confirm_interval
+        self.standby_confirmed_at = 0.0
+        self.standby_retry_min = standby_retry_min
+        self.standby_retry_max = standby_retry_max
+        self.standby_retry_delay = standby_retry_min
+        self.standby_retry_at = 0.0
+        # Hot phones that were available when the last attempt failed: the backoff applies to them
+        self.standby_failed_phones: set[str] = set()
 
     @property
     def active(self) -> bool:
@@ -481,21 +522,35 @@ class FailoverCoordinator:
         self.routing.disable_routing_and_nat()
         self.routing.teardown_wireguard_interface()
 
-    def activate(self, avoid: str | None = None, prefer: str | None = None) -> bool:
+    def is_hot(self, phone_id: str) -> bool:
+        """The phone announces hot standby (and this gateway allows it)."""
+        return self.hot_standby and self.discovery.standby_of(phone_id) == pairing.STANDBY_HOT
+
+    def hot_phones(self) -> list[tuple[str, str]]:
+        return [(pid, ip) for pid, ip in self.discovery.get_available_phones() if self.is_hot(pid)]
+
+    def activate(self, avoid: str | None = None, prefer: str | None = None, standby: bool = False) -> bool:
         """
         Starts failover on the first available phone that succeeds. [avoid] (a phone just lost)
-        is tried last, [prefer] first (phone IDs).
+        is tried last, [prefer] first (phone IDs), then phones offering hot standby, which keep
+        their cellular up anyway. With [standby] (no outage), only those are used.
         """
-        candidates = self.discovery.get_available_phones()
-        candidates.sort(key=lambda c: 0 if c[0] == prefer else 2 if c[0] == avoid else 1)
+        candidates = self.hot_phones() if standby else self.discovery.get_available_phones()
+        candidates.sort(key=lambda c: 0 if c[0] == prefer else 3 if c[0] == avoid else 1 if self.is_hot(c[0]) else 2)
         if not candidates:
-            logger.error("Cannot activate failover: no paired smartphone available")
+            if not standby:
+                logger.error("Cannot activate failover: no paired smartphone available")
             return False
 
         for phone_id, ip in candidates:
             label = self.label(phone_id, ip)
             try:
-                activate_failover(self.client(phone_id, ip), self.routing)
+                activate_failover(self.client(phone_id, ip), self.routing, standby=standby)
+            except StandbyDeclined as e:
+                # Its announcement was stale: nothing was started
+                logger.info(f"Smartphone {label}: {e}")
+                self._teardown_local()
+                continue
             except PhoneRequestError as e:
                 # Refused before anything was set up here (e.g. 409: serving another gateway)
                 logger.error(f"Smartphone {label} refused failover: {e}")
@@ -508,7 +563,12 @@ class FailoverCoordinator:
                 continue
             self.active_phone = (phone_id, ip)
             self.tunnel_failures = 0
-            logger.info(f"Failover active via smartphone {label}")
+            self.carrying = not standby
+            self.standby_confirmed_at = time.monotonic()
+            if standby:
+                logger.info(f"Hot standby active via smartphone {label}: the router sees WAN 2 online")
+            else:
+                logger.info(f"Failover active via smartphone {label}")
             return True
         return False
 
@@ -518,6 +578,49 @@ class FailoverCoordinator:
             self.release_phone(*self.active_phone)
         self.active_phone = None
         self.tunnel_failures = 0
+        self.carrying = False
+
+    def try_standby(self, now: float | None = None) -> bool:
+        """Brings up a hot standby tunnel if a phone offers one; failures back off (30 s → 5 min)."""
+        now = time.monotonic() if now is None else now
+        if not self.hot_standby:
+            return False
+        hot = {pid for pid, _ in self.hot_phones()}
+        # A phone that left (or stopped offering it) and comes back starts afresh
+        self.standby_failed_phones &= hot
+        if not hot or (now < self.standby_retry_at and hot <= self.standby_failed_phones):
+            return False
+        if self.activate(standby=True):
+            self.standby_retry_delay = self.standby_retry_min
+            self.standby_retry_at = 0.0
+            self.standby_failed_phones = set()
+            return True
+        if not hot <= self.standby_failed_phones:
+            self.standby_retry_delay = self.standby_retry_min
+        logger.warning(f"Hot standby could not start; retrying in {self.standby_retry_delay:.0f}s")
+        self.standby_failed_phones = hot
+        self.standby_retry_at = now + self.standby_retry_delay
+        self.standby_retry_delay = min(self.standby_retry_delay * 2, self.standby_retry_max)
+        return False
+
+    def standby_still_offered(self, now: float | None = None, force: bool = False) -> bool:
+        """
+        Whether the active phone still offers hot standby: its announcement must say so (a
+        "cold" one ends it right away), and its signed status confirms it every
+        [standby_confirm_interval], so a replayed "hot" broadcast can't keep the tunnel up.
+        """
+        if not self.active_phone or not self.is_hot(self.active_phone[0]):
+            return False
+        now = time.monotonic() if now is None else now
+        if not force and now - self.standby_confirmed_at < self.standby_confirm_interval:
+            return True
+        self.standby_confirmed_at = now
+        try:
+            return self.client(*self.active_phone).get_status().get("standby") == pairing.STANDBY_HOT
+        except Exception as e:
+            # Unreachable over HTTP: the tunnel probes decide whether the phone is lost
+            logger.debug(f"Standby confirmation from {self.active_phone_label} failed: {e}")
+            return True
 
     def tunnel_lost(self) -> bool:
         """
@@ -540,6 +643,119 @@ class FailoverCoordinator:
         logger.error(f"!!! Smartphone {self.active_phone_label} lost: handing failover over to another smartphone... !!!")
         self.deactivate()
         return self.activate(avoid=lost_id)
+
+
+class FailoverLoop:
+    """
+    One health check per step(). The gateway is in one of three states:
+      - idle: no tunnel; WAN 1 failing [fail_threshold] times starts failover (cold standby),
+        and a phone offering hot standby gets a tunnel right away;
+      - hot standby: tunnel up, the router still uses WAN 1 (but sees WAN 2 online);
+      - carrying: the router uses WAN 2 (the canary from the primary interface answers).
+    After an outage, a phone still offering hot standby keeps its tunnel; others are released.
+    """
+
+    def __init__(self, coordinator: "FailoverCoordinator", args: argparse.Namespace):
+        self.coordinator = coordinator
+        self.args = args
+        self.failed_probes = 0
+        self.success_probes = 0
+        # Last reported state while a tunnel is up ("wan2" / "waiting" / "standby"), to log changes only
+        self.active_state: str | None = None
+
+    def step(self):
+        if self.coordinator.active:
+            self._step_active()
+        else:
+            self._step_idle()
+
+    def _step_idle(self):
+        args, coordinator = self.args, self.coordinator
+        if check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout):
+            self.failed_probes = 0
+            coordinator.try_standby()
+            return
+
+        self.failed_probes += 1
+        self.success_probes = 0
+        logger.warning(f"WAN 1 probe ({args.primary_iface}): FAILED ({self.failed_probes}/{args.fail_threshold})")
+        if self.failed_probes >= args.fail_threshold:
+            logger.error("!!! WAN 1 OUTAGE DETECTED !!! Activating cellular failover...")
+            if coordinator.activate():
+                self.failed_probes = 0
+                self.active_state = None
+                logger.info(">>> Cellular WAN 2 Failover 100% OPERATIONAL. Router routes traffic via smartphone. <<<")
+
+    def _step_active(self):
+        args, coordinator = self.args, self.coordinator
+        if coordinator.tunnel_lost():
+            self.active_state = None
+            self.success_probes = 0
+            # The phone carrying the tunnel stopped answering through it
+            if check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout):
+                # No outage: drop it (a phone offering hot standby gets a new tunnel on the next check)
+                logger.info("Tunnel lost but WAN 1 is reachable: releasing the smartphone")
+                coordinator.deactivate()
+                self.failed_probes = 0
+            elif coordinator.hand_over():
+                logger.info(f">>> Failover handed over to smartphone {coordinator.active_phone_label}. <<<")
+            else:
+                # Still in an outage: retry activation on the next failed WAN 1 probe
+                logger.error("No smartphone could take over the failover; retrying on next probe")
+                self.failed_probes = max(args.fail_threshold - 1, 0)
+            return
+        if coordinator.tunnel_failures:
+            # Tunnel probe failing: wait for the next probes before deciding
+            return
+
+        # If the router routes LAN default traffic through WAN 2, the non-routable canary IP
+        # (198.18.0.1) reaches eth1 -> wg0 and is answered by the phone's relay
+        if check_tunnel_canary(args.primary_iface, args.canary_ip, timeout=args.ping_timeout):
+            coordinator.carrying = True
+            self.success_probes = 0
+            self._report(
+                "wan2",
+                f"WAN 2 active: LAN traffic routed via backup cellular ({args.failover_iface}). "
+                f"Standby for primary WAN recovery...",
+            )
+            return
+
+        if not coordinator.carrying:
+            # Hot standby while the router uses WAN 1
+            if coordinator.standby_still_offered():
+                self._report("standby", f"Hot standby via smartphone {coordinator.active_phone_label}: WAN 2 ready")
+            else:
+                logger.info(f"Smartphone {coordinator.active_phone_label} no longer offers hot standby: releasing it")
+                self.active_state = None
+                coordinator.deactivate()
+            return
+
+        # Canary timed out: outbound traffic no longer goes out WAN 2. Is WAN 1 healthy?
+        if not check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout):
+            self.success_probes = 0
+            self._report("waiting", f"Router is not using WAN 2, but primary WAN ({args.primary_iface}) is still unreachable", logging.WARNING)
+            return
+
+        self.active_state = None
+        self.success_probes += 1
+        logger.info(f"WAN 1 probe ({args.primary_iface}): Direct via Primary ({self.success_probes}/{args.restore_threshold})")
+        if self.success_probes < args.restore_threshold:
+            return
+        self.success_probes = 0
+        if coordinator.standby_still_offered(force=True):
+            logger.info(f">>> WAN 1 recovery confirmed! Back to hot standby via smartphone {coordinator.active_phone_label}. <<<")
+            coordinator.carrying = False
+            return
+        logger.info(">>> WAN 1 recovery confirmed! Tearing down cellular failover... <<<")
+        # Routing/NAT off first (router falls back to WAN 1 instantly), then wg0,
+        # then the phone releases its cellular radio
+        coordinator.deactivate()
+        logger.info("Failback to WAN 1 completed successfully.")
+
+    def _report(self, state: str, message: str, level: int = logging.INFO):
+        if self.active_state != state:
+            logger.log(level, message)
+            self.active_state = state
 
 
 def check_tunnel_canary(iface: str, canary_ip: str = "198.18.0.1", timeout: int = 2) -> bool:
@@ -590,6 +806,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fail-threshold", type=int, default=int(os.environ.get("FAIL_THRESHOLD", "3")), help="Consecutive failures before failover")
     parser.add_argument("--restore-threshold", type=int, default=int(os.environ.get("RESTORE_THRESHOLD", "5")), help="Consecutive successes before failback")
     parser.add_argument("--tunnel-fail-threshold", type=int, default=int(os.environ.get("TUNNEL_FAIL_THRESHOLD", "3")), help="Consecutive failed tunnel probes before the phone is considered lost and failover is handed over")
+    parser.add_argument("--hot-standby", action=argparse.BooleanOptionalAction, default=os.environ.get("HOT_STANDBY", "true").lower() in ("true", "1", "yes"), help="Keep the tunnel up at all times with phones that offer hot standby (default: enabled)")
     parser.add_argument("--check-interval", type=int, default=int(os.environ.get("CHECK_INTERVAL", "5")), help="Health check interval in seconds")
     parser.add_argument("--discover-only", action="store_true", help="Print discovered smartphone IP and exit")
     parser.add_argument("--status-only", action="store_true", help="Print smartphone status and exit")
@@ -740,11 +957,12 @@ def list_phones(store: "pairing.PairingStore", discovery: "PhoneDiscovery"):
     # Phones broadcast every 5s
     time.sleep(6)
     online = dict(discovery.get_available_phones())
-    print(f"{'NAME':<28} {'WI-FI':<20} {'PAIRED':<17} {'STATUS':<22} ID")
+    print(f"{'NAME':<28} {'WI-FI':<20} {'PAIRED':<17} {'STATUS':<22} {'STANDBY':<8} ID")
     for p in phones:
         paired = time.strftime("%Y-%m-%d %H:%M", time.localtime(p.paired_at)) if p.paired_at else "?"
         status = f"online ({online[p.id]})" if p.id in online else "not seen"
-        print(f"{p.label:<28} {p.ssid:<20} {paired:<17} {status:<22} {p.id}")
+        standby = discovery.standby_of(p.id) if p.id in online else "-"
+        print(f"{p.label:<28} {p.ssid:<20} {paired:<17} {status:<22} {standby:<8} {p.id}")
 
 
 def main():
@@ -789,6 +1007,7 @@ def main():
         canary_ip=args.canary_ip,
         ping_timeout=args.ping_timeout,
         tunnel_fail_threshold=args.tunnel_fail_threshold,
+        hot_standby=args.hot_standby,
     )
 
     selected = resolve_phone(store, args.phone)
@@ -854,10 +1073,7 @@ def main():
         return
 
     # Main monitoring loop
-    failed_probes = 0
-    # Last reported egress state while failover is active ("wan2" / "waiting"), to log changes only
-    active_state: str | None = None
-    success_probes = 0
+    loop = FailoverLoop(coordinator, args)
     running = True
 
     def sig_handler(signum, frame):
@@ -879,6 +1095,7 @@ def main():
     logger.info(f"  - Non-routable canary IP     : {args.canary_ip}")
     logger.info(f"  - Fail / restore thresholds  : {args.fail_threshold} failures / {args.restore_threshold} successes")
     logger.info(f"  - Lost phone after           : {args.tunnel_fail_threshold} failed tunnel probes")
+    logger.info(f"  - Hot standby                : {'enabled (phones that offer it)' if args.hot_standby else 'disabled'}")
     logger.info(f"  - Health check interval      : {args.check_interval}s")
     logger.info(f"  - Paired smartphones         : {', '.join(p.label for p in store.phones()) or 'none (run wanctl pair)'}")
     logger.info("====================================================================")
@@ -893,76 +1110,7 @@ def main():
 
     try:
         while running:
-            if coordinator.active:
-                if coordinator.tunnel_lost():
-                    active_state = None
-                    # The phone carrying the failover stopped answering through the tunnel
-                    if check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout):
-                        logger.info("Tunnel lost but WAN 1 is reachable: ending cellular failover")
-                        coordinator.deactivate()
-                        failed_probes = 0
-                    elif coordinator.hand_over():
-                        logger.info(f">>> Failover handed over to smartphone {coordinator.active_phone_label}. <<<")
-                    else:
-                        # Still in an outage: retry activation on the next failed WAN 1 probe
-                        logger.error("No smartphone could take over the failover; retrying on next probe")
-                        failed_probes = max(args.fail_threshold - 1, 0)
-                    success_probes = 0
-                elif coordinator.tunnel_failures == 0:
-                    # While failover is active, test the non-routable canary IP (198.18.0.1).
-                    # If the router is still routing LAN default traffic through WAN 2,
-                    # the canary probe reaches eth1 -> wg0 and is answered by the phone's relay.
-                    is_wan2_active = check_tunnel_canary(args.primary_iface, args.canary_ip, timeout=args.ping_timeout)
-                    if is_wan2_active:
-                        success_probes = 0
-                        if active_state != "wan2":
-                            logger.info(
-                                f"WAN 2 active: LAN traffic routed via backup cellular ({args.failover_iface}). "
-                                f"Standby for primary WAN recovery..."
-                            )
-                            active_state = "wan2"
-                    else:
-                        # Canary timed out! Outbound traffic is no longer going out WAN 2.
-                        # Verify if primary WAN 1 is healthy and passing traffic to public targets.
-                        wan1_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
-                        if wan1_ok:
-                            active_state = None
-                            success_probes += 1
-                            logger.info(
-                                f"WAN 1 probe ({args.primary_iface}): Direct via Primary "
-                                f"({success_probes}/{args.restore_threshold})"
-                            )
-                            if success_probes >= args.restore_threshold:
-                                logger.info(">>> WAN 1 recovery confirmed! Tearing down cellular failover... <<<")
-                                # Routing/NAT off first (router falls back to WAN 1 instantly), then wg0,
-                                # then the phone releases its cellular radio
-                                coordinator.deactivate()
-                                success_probes = 0
-                                logger.info("Failback to WAN 1 completed successfully.")
-                        else:
-                            success_probes = 0
-                            if active_state != "waiting":
-                                logger.warning(
-                                    f"Router is not using WAN 2, but primary WAN ({args.primary_iface}) is still unreachable"
-                                )
-                                active_state = "waiting"
-                # else: tunnel probe failing, wait for the next probes before deciding
-            else:
-                wan_ok = check_primary_wan(args.primary_iface, args.targets, timeout=args.ping_timeout)
-                if not wan_ok:
-                    failed_probes += 1
-                    success_probes = 0
-                    logger.warning(f"WAN 1 probe ({args.primary_iface}): FAILED ({failed_probes}/{args.fail_threshold})")
-
-                    if failed_probes >= args.fail_threshold:
-                        logger.error("!!! WAN 1 OUTAGE DETECTED !!! Activating cellular failover...")
-                        if coordinator.activate():
-                            failed_probes = 0
-                            active_state = None
-                            logger.info(">>> Cellular WAN 2 Failover 100% OPERATIONAL. Router routes traffic via smartphone. <<<")
-                else:
-                    failed_probes = 0
-
+            loop.step()
             time.sleep(args.check_interval)
 
     finally:

@@ -52,6 +52,8 @@ interface FailoverControlDelegate {
     val wireguardPublicKey: String
     val wireguardTunnelIp: String
     val wireguardPeerIp: String
+    /** "hot" or "cold" (AuthProtocol.STANDBY_*) */
+    val standby: String
     suspend fun startFailover(gatewayPublicKey: Key, gatewayId: String): FailoverStartResult
     /** Returns false (and keeps the relay) when another gateway owns the active failover. */
     suspend fun stopFailover(gatewayId: String): Boolean
@@ -120,7 +122,8 @@ class ControlHttpServer(
                                     public_key = delegate.wireguardPublicKey,
                                     tunnel_ip = delegate.wireguardTunnelIp,
                                     peer_ip = delegate.wireguardPeerIp
-                                )
+                                ),
+                                standby = delegate.standby
                             )
                         )
                     }

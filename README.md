@@ -38,7 +38,8 @@ flowchart LR
 * **Zero SOCKS5 / tun2socks** : Pure WireGuard architecture end-to-end delivering optimal throughput and supporting IP, UDP (DNS), and ICMP (UniFi health check pings).
 * **Forced Cellular Outbound** : Outbound internet sockets are bound directly to the active cellular network handle using NDK `android_setsocknetwork(netHandle, fd)`. The smartphone remains connected to local Wi-Fi.
 * **Android 15 (ARM64) 16 KB Page-Size Compliant** : Native binary built with 16 KB ELF page alignment (`-Wl,-z,max-page-size=16384`) verified via `zipalign`.
-* **Power Efficiency** : During normal operation, cellular data and the WireGuard relay remain dormant (`idle`). They are awakened on-demand by the gateway only when WAN 1 fails.
+* **Power Efficiency** : By default (*On demand* standby), cellular data and the WireGuard relay remain dormant (`idle`) during normal operation. They are awakened by the gateway only when WAN 1 fails.
+* **Hot Standby (optional)** : A phone that stays on its charger (e.g. an old phone) can offer an always-on tunnel instead, so the router sees WAN 2 online at all times, monitors it, and switches over without waiting for the gateway (see [Hot standby](#7-hot-standby-always-on-backup-wan)).
 * **Complete Host Isolation** : Everything runs inside an all-in-one Alpine Docker container using `--network host`. No packages installed on the host OS.
 
 ---
@@ -140,6 +141,7 @@ services:
       - FAIL_THRESHOLD=3
       - RESTORE_THRESHOLD=5
       - CHECK_INTERVAL=5
+      - HOT_STANDBY=true   # Always-on tunnel with phones that offer it (see "Hot standby")
     volumes:
       - /lib/modules:/lib/modules:ro
       - gateway-config:/config   # Gateway ID and paired phones
@@ -210,5 +212,41 @@ Optional shortcut on the host: `alias wanctl='docker exec -it wan-failover-gatew
 1. **Continuous Monitoring** : The watchdog continuously monitors WAN 1 (`eth0`) using periodic ICMP pings to `1.1.1.1` and `8.8.8.8`.
 2. **Outage Detection** : Upon 3 consecutive ping failures, the watchdog invokes the phone's local HTTP API (`POST /v1/failover/start`). Every request and answer is signed with that phone's pairing secret, and the phone only accepts it on the Wi-Fi network it was paired on ([PROTOCOL.md](PROTOCOL.md)).
 3. **Instant Failover** : The Pi generates a fresh WireGuard key pair for this activation and sends only its public key in the start request. The phone activates cellular data and starts its userspace WireGuard relay, keyed to that public key. The phone's HTTP API (`8989`) and relay (`51820`) listen on its Wi-Fi address only, never on the cellular interface. The Pi builds its own `wg0` config from validated fields, brings up `wg0`, sets up Table 100 policy routing, and configures iptables MASQUERADE. The router detects WAN 2 healthy and routes all LAN traffic through it.
-4. **Tunnel Canary Verification & Automatic Recovery (Failback)** : While failover is active, the watchdog probes a non-routable benchmark IP (`198.18.0.1`, RFC 2544 / RFC 6890). If LAN default traffic is routed out WAN 2, the phone's WireGuard relay synthesizes replies and the canary succeeds, keeping failover active without flapping. Once primary WAN 1 recovers and the router switches its default route back to WAN 1, the canary times out (ISPs drop `198.18.0.1`). The watchdog then verifies direct internet connectivity via primary WAN 1 (`1.1.1.1`). After 5 consecutive direct successes, the Pi tears down `wg0`, flushes routing tables, and signals the phone to release cellular data (`POST /v1/failover/stop`).
+4. **Tunnel Canary Verification & Automatic Recovery (Failback)** : While failover is active, the watchdog probes a non-routable benchmark IP (`198.18.0.1`, RFC 2544 / RFC 6890). If LAN default traffic is routed out WAN 2, the phone's WireGuard relay synthesizes replies and the canary succeeds, keeping failover active without flapping. Once primary WAN 1 recovers and the router switches its default route back to WAN 1, the canary times out (ISPs drop `198.18.0.1`). The watchdog then verifies direct internet connectivity via primary WAN 1 (`1.1.1.1`). After 5 consecutive direct successes, the Pi tears down `wg0`, flushes routing tables, and signals the phone to release cellular data (`POST /v1/failover/stop`). A phone in hot standby keeps its tunnel instead (see below).
+
+---
+
+## 7. Hot Standby (Always-On Backup WAN)
+
+On demand (*cold*) failover takes a while: the gateway needs 3 failed probes (15 s) to detect the outage, then brings up cellular and the tunnel, then the router has to notice WAN 2 is online before it switches. In **hot standby**, the tunnel is up before the outage: the router sees WAN 2 online at all times, monitors it, and fails over as soon as it detects that WAN 1 is down.
+
+### On the phone
+
+In the app, choose a **Standby Mode**:
+
+| Mode | Behaviour |
+| :--- | :--- |
+| **On demand** (default) | Cold standby: cellular starts only during an outage. |
+| **Plugged in** | Hot standby while the phone is plugged in; on demand on battery (2 minutes after unplugging). |
+| **Always** | Hot standby, even on battery. |
+
+"Plugged in" means connected to power, whether or not it is charging, so it works with a charge limit. For a phone that lives on its charger, turn on its battery protection (e.g. Pixel: *Settings > Battery > Charging optimization > Limit to 80%*) and set its battery usage to **Unrestricted**.
+
+### On the gateway
+
+Nothing to do: hot standby is on by default (`HOT_STANDBY=true`; set it to `false` to only ever use on-demand failover). While a phone offers hot standby, the gateway keeps `wg0`, Table 100 and the NAT rules up:
+
+- **Hot standby**: the router uses WAN 1 and sees WAN 2 online. The gateway checks the tunnel every 5 s (the phone answers those probes itself, so they use no mobile data) and rebuilds it if the phone is lost.
+- **Carrying**: the router switched to WAN 2. When WAN 1 is back, the phone returns to hot standby.
+- If the phone stops offering hot standby (unplugged, setting changed), the gateway releases it, unless the router is using WAN 2 at that moment: then it keeps the tunnel until WAN 1 is back. On battery, the phone still carries the traffic during an outage.
+- If several phones offer hot standby, only one carries the tunnel; another one takes over if it is lost.
+
+`wanctl phones` shows the standby each phone offers.
+
+### On the router (UniFi)
+
+- Set WAN 2 to **Failover only**, not load balancing: otherwise part of the LAN traffic goes out over cellular at all times.
+- Turn off scheduled speed tests on WAN 2.
+- The router's WAN 2 monitoring (pings, DNS checks) now goes out over cellular continuously. It is small, but check the phone's mobile data usage after the first days.
+
 

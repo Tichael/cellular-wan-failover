@@ -30,9 +30,13 @@ class TestVectors:
         fields = pairing.response_fields(GW_ID, VECTOR_PHONE, VECTOR_NONCE, 200, b'{"result":"active"}')
         assert pairing.sign(VECTOR_KEY, fields) == "Nhk2S2diibbLHvgOw8ZO5f05LA3RO9iKbalJsf2pxwk"
 
-    def test_discovery_signature(self):
-        fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23")
-        assert pairing.sign(VECTOR_KEY, fields) == "_BT36DkjoiviLRKqYY75UWrC-xtB5Z4ITgCPfnrqLCA"
+    @pytest.mark.parametrize("standby, signature", [
+        ("cold", "TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs"),
+        ("hot", "nHAaCXKjpBSE27oH7pAXu6-cZu6zq0rgfHcQUg7P_xc"),
+    ])
+    def test_discovery_signature(self, standby, signature):
+        fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23", standby)
+        assert pairing.sign(VECTOR_KEY, fields) == signature
 
     def test_replace_signature(self):
         fields = pairing.replace_fields(GW_ID, "b2xkLXBob25lLWlkLTAwMQ", VECTOR_PHONE)
@@ -51,12 +55,12 @@ class TestVectors:
 
 class TestSigning:
     def test_verify_round_trip(self):
-        fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "10.0.0.2")
+        fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "10.0.0.2", "cold")
         assert pairing.verify(VECTOR_KEY, pairing.sign(VECTOR_KEY, fields), fields)
 
-    @pytest.mark.parametrize("signature", [None, "", "x", 42, "_BT36DkjoiviLRKqYY75UWrC-xtB5Z4ITgCPfnrqLCB"])
+    @pytest.mark.parametrize("signature", [None, "", "x", 42, "TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGt"])
     def test_verify_rejects(self, signature):
-        assert not pairing.verify(VECTOR_KEY, signature, pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23"))
+        assert not pairing.verify(VECTOR_KEY, signature, pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23", "cold"))
 
     def test_fields_cannot_be_shifted(self):
         # A newline inside a field could make two different messages sign the same bytes
