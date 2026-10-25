@@ -192,9 +192,11 @@ fun MainScreen(
         modifier = Modifier.fillMaxSize(),
         containerColor = MaterialTheme.colorScheme.background
     ) { paddingValues ->
+        // Scrolls: the cards together are taller than most screens
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .verticalScroll(rememberScrollState())
                 .padding(paddingValues)
                 .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
@@ -263,7 +265,7 @@ fun MainScreen(
             LogViewerCard(
                 logs = logs,
                 onClearLogs = { controller.clearLogs() },
-                modifier = Modifier.weight(1f)
+                modifier = Modifier.height(320.dp)
             )
         }
     }
