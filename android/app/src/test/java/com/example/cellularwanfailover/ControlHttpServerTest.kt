@@ -10,6 +10,7 @@ import com.example.cellularwanfailover.http.FailoverStartResult
 import com.example.cellularwanfailover.model.ChallengeResponse
 import com.example.cellularwanfailover.model.FailoverActionResponse
 import com.example.cellularwanfailover.model.StatusResponse
+import com.example.cellularwanfailover.power.BatterySettings
 import com.wireguard.crypto.Key
 import kotlinx.serialization.json.Json
 import org.junit.After
@@ -51,6 +52,9 @@ class ControlHttpServerTest {
         override val wireguardTunnelIp: String get() = "10.100.0.1"
         override val wireguardPeerIp: String get() = "10.100.0.2"
         override val standby: String get() = "hot"
+        override val batteryLevel: Int get() = 64
+        override val isPluggedIn: Boolean get() = true
+        override val batterySettings: BatterySettings get() = BatterySettings(minBattery = 30, lastResort = false)
         override suspend fun startFailover(gatewayPublicKey: Key, gatewayId: String): FailoverStartResult {
             startedBy = gatewayId
             receivedGatewayKey = gatewayPublicKey
@@ -158,6 +162,10 @@ class ControlHttpServerTest {
         assertEquals(12345L, status.bytes_transmitted)
         assertEquals("mockWireguardPublicKey==", status.wireguard?.public_key)
         assertEquals("hot", status.standby)
+        assertEquals(64, status.battery)
+        assertTrue(status.plugged)
+        assertEquals(30, status.min_battery)
+        assertFalse(status.last_resort)
     }
 
     @Test
@@ -223,6 +231,15 @@ class ControlHttpServerTest {
         assertEquals(409, answer.code)
         assertSignedByPhone(answer)
         assertEquals("busy", json.decodeFromString<FailoverActionResponse>(answer.body).result)
+    }
+
+    @Test
+    fun testStartFailoverDeclinedOnLowBatteryIsSignedConflict() {
+        startResult = FailoverStartResult.Declined("Battery below the phone's minimum")
+        val answer = signedCall("POST", "/v1/failover/start", """{"gateway_public_key": "$validGatewayKey"}""")
+        assertEquals(409, answer.code)
+        assertSignedByPhone(answer)
+        assertEquals("declined", json.decodeFromString<FailoverActionResponse>(answer.body).result)
     }
 
     @Test

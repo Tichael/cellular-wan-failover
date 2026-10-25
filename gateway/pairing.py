@@ -74,12 +74,28 @@ def response_fields(gateway_id: str, phone_id: str, nonce: str, status: int, bod
     return ["wf1-resp", gateway_id, phone_id, nonce, str(status), body_hash(body)]
 
 
-def discovery_fields(gateway_id: str, phone_id: str, phone_ip: str, standby: str) -> list[str]:
-    return ["wf1-disc", gateway_id, phone_id, phone_ip, standby]
+def discovery_fields(
+    gateway_id: str, phone_id: str, phone_ip: str, standby: str, battery: int, plugged: bool, min_battery: int, last_resort: bool
+) -> list[str]:
+    return [
+        "wf1-disc", gateway_id, phone_id, phone_ip, standby,
+        str(battery), POWER_PLUGGED if plugged else POWER_UNPLUGGED,
+        str(min_battery), LAST_RESORT if last_resort else NO_LAST_RESORT,
+    ]
 
 
 STANDBY_HOT = "hot"
 STANDBY_COLD = "cold"
+POWER_PLUGGED = "plugged"
+POWER_UNPLUGGED = "unplugged"
+# Whether a phone below its minimum battery may still carry an outage no other phone can
+LAST_RESORT = "last-resort"
+NO_LAST_RESORT = "no-last-resort"
+
+
+def valid_battery(value: object) -> bool:
+    """A battery level as phones report it (state of charge, minimum): an integer percentage."""
+    return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 100
 
 
 def replace_fields(gateway_id: str, old_phone_id: str, new_phone_id: str) -> list[str]:
