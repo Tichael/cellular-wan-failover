@@ -9,7 +9,7 @@ data class BatterySettings(val minBattery: Int = DEFAULT_MIN_BATTERY, val lastRe
     companion object {
         const val DEFAULT_MIN_BATTERY = 20
         /** Choices offered in the app, in % */
-        const val MAX_MIN_BATTERY = 50
+        const val MAX_MIN_BATTERY = 100
         const val MIN_BATTERY_STEP = 5
     }
 }
