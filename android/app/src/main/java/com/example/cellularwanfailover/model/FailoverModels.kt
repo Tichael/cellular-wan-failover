@@ -35,7 +35,13 @@ data class StatusResponse(
     val bytes_transmitted: Long,
     val wireguard: WireGuardInfo? = null,
     /** "hot": the gateway may keep the tunnel up at all times; "cold": only during an outage */
-    val standby: String = "cold"
+    val standby: String = "cold",
+    /** Battery state of charge (%); the gateway prefers phones plugged in or with more battery */
+    val battery: Int,
+    val plugged: Boolean,
+    /** The phone's settings: below min_battery (on battery), only carries an outage as a last resort, if allowed */
+    val min_battery: Int,
+    val last_resort: Boolean
 )
 
 @Serializable

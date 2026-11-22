@@ -1,5 +1,6 @@
 package com.example.cellularwanfailover.auth
 
+import com.example.cellularwanfailover.power.BatterySettings
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -56,6 +57,12 @@ data class DiscoveryEntry(
     val pid: String,
     /** "hot" while the phone offers an always-on tunnel, "cold" (on demand) otherwise */
     val standby: String,
+    /** Battery state of charge (%) */
+    val battery: Int,
+    val plugged: Boolean,
+    /** The phone's minimum battery (%), and whether it may still carry an outage below it when no other phone can */
+    val min_battery: Int,
+    val last_resort: Boolean,
     val sig: String
 )
 
@@ -234,22 +241,31 @@ class GatewayAuthenticator(
 
     /** UDP discovery payload for the gateways paired on [currentSsid], or null if there are none. */
     @Synchronized
-    fun discoveryPayload(currentSsid: String?, wifiIp: String?, standby: String = AuthProtocol.STANDBY_COLD): ByteArray? {
+    fun discoveryPayload(
+        currentSsid: String?,
+        wifiIp: String?,
+        standby: String = AuthProtocol.STANDBY_COLD,
+        battery: Int = 100,
+        plugged: Boolean = false,
+        batterySettings: BatterySettings = BatterySettings()
+    ): ByteArray? {
         if (currentSsid == null || wifiIp == null) return null
         val entries = mutableListOf<DiscoveryEntry>()
+        fun add(gatewayId: String, phoneId: String, standby: String, signer: MessageSigner) {
+            val (minBattery, lastResort) = batterySettings
+            val fields = AuthProtocol.discoveryFields(gatewayId, phoneId, wifiIp, standby, battery, plugged, minBattery, lastResort)
+            entries += DiscoveryEntry(gatewayId, phoneId, standby, battery, plugged, minBattery, lastResort, signer.sign(fields))
+        }
         for (pairing in repository.pairings.value) {
             if (pairing.ssid != currentSsid) continue
             val signer = repository.signer(pairing) ?: continue
-            entries += discoveryEntry(pairing.gatewayId, pairing.phoneId, wifiIp, standby, signer)
+            add(pairing.gatewayId, pairing.phoneId, standby, signer)
         }
         // A pending pairing can't serve yet
         pending?.takeIf { it.ssid == currentSsid }?.let {
-            entries += discoveryEntry(it.invite.gatewayId, it.invite.phoneId, wifiIp, AuthProtocol.STANDBY_COLD, it.signer)
+            add(it.invite.gatewayId, it.invite.phoneId, AuthProtocol.STANDBY_COLD, it.signer)
         }
         if (entries.isEmpty()) return null
         return json.encodeToString(DiscoveryPayload(pairings = entries)).toByteArray(Charsets.UTF_8)
     }
-
-    private fun discoveryEntry(gatewayId: String, phoneId: String, wifiIp: String, standby: String, signer: MessageSigner) =
-        DiscoveryEntry(gatewayId, phoneId, standby, signer.sign(AuthProtocol.discoveryFields(gatewayId, phoneId, wifiIp, standby)))
 }

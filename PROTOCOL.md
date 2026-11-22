@@ -29,7 +29,7 @@ All binary values are written as base64url without padding. Signatures are `base
 |---|---|
 | Request | `wf1-req`, gateway_id, phone_id, METHOD, path, challenge, nonce, hex(sha256(body)) |
 | Response | `wf1-resp`, gateway_id, phone_id, nonce, HTTP status, hex(sha256(body)) |
-| Discovery | `wf1-disc`, gateway_id, phone_id, phone Wi-Fi IPv4, standby (`hot` or `cold`) |
+| Discovery | `wf1-disc`, gateway_id, phone_id, phone Wi-Fi IPv4, standby (`hot` or `cold`), battery (decimal 0–100), power (`plugged` or `unplugged`), minimum battery (decimal 0–100), `last-resort` or `no-last-resort` |
 | Replace | `wf1-replace`, gateway_id, old phone_id, new phone_id |
 | Pairing code | `wf1-code`, gateway_id, phone_id |
 
@@ -68,10 +68,12 @@ in /config/pairing.json under its name
 ## Discovery (UDP broadcast, port 8990, every 5 s)
 
 ```json
-{"service": "wan-failover", "v": 1, "pairings": [{"gw": "<gateway_id>", "pid": "<phone_id>", "standby": "hot", "sig": "<Discovery signature>"}]}
+{"service": "wan-failover", "v": 1, "pairings": [{"gw": "<gateway_id>", "pid": "<phone_id>", "standby": "hot", "battery": 85, "plugged": true, "min_battery": 20, "last_resort": true, "sig": "<Discovery signature>"}]}
 ```
 
-`standby` says whether the phone offers hot standby (an always-on tunnel; see the README); the pending pairing is always `cold`. An entry without a valid `standby` is ignored. The gateway uses it only as a hint: before starting or keeping a hot standby tunnel, it confirms it with the signed `/v1/status`. A replayed `hot` beacon therefore can't keep the tunnel up for more than about a minute, and a replayed `cold` one only makes the gateway release the phone.
+`standby` says whether the phone offers hot standby (an always-on tunnel; see the README); the pending pairing is always `cold`. `battery` is the battery state of charge in percent (integer 0–100) and `plugged` whether the phone is plugged in (JSON boolean; signed as `plugged`/`unplugged`). `min_battery` (integer 0–100) and `last_resort` (JSON boolean; signed as `last-resort`/`no-last-resort`) are the phone's own settings: below its minimum on battery, the gateway uses another phone if it can, and uses this one only if `last_resort` is true. An entry without valid values for all of these is ignored.
+
+The gateway uses these values to choose a phone, but only as hints: before starting or keeping a hot standby tunnel, it confirms `standby` with the signed `/v1/status`, and before moving the failover off a phone (or releasing it) because its battery is low, it confirms that with the phone's signed `/v1/status` too. A replayed `hot` beacon therefore can't keep the tunnel up for more than about a minute, and a replayed `cold` or low-battery one only makes the gateway release the phone (in standby) or ask it again.
 
 The packet contains one entry per gateway paired on the current Wi-Fi network, plus the pending pairing if there is one. A gateway uses only its own entry, and only if the signature matches the packet's source address. Discovery only tells the gateway where the phone is. A replayed packet from another address is rejected, and a forged source address only points the gateway at the real phone. The signed HTTP exchange below is what actually protects the phone.
 
@@ -86,8 +88,8 @@ The phone's challenge and the gateway's nonce make both directions fresh without
 
 | Route | Purpose |
 |---|---|
-| `GET /v1/status` | State, standby (`hot`/`cold`) and the phone's WireGuard public key and port |
-| `POST /v1/failover/start` `{"gateway_public_key"}` | Start cellular + relay. `409` if another gateway is using the relay |
+| `GET /v1/status` | State, standby (`hot`/`cold`), `battery` (%), `plugged`, `min_battery`, `last_resort`, and the phone's WireGuard public key and port |
+| `POST /v1/failover/start` `{"gateway_public_key"}` | Start cellular + relay. `409` if another gateway is using the relay (`busy`), or the battery is below the phone's minimum and `last_resort` is off (`declined`) |
 | `POST /v1/failover/stop` | Stop it. `409` if another gateway started it |
 | `POST /v1/pair/complete` | Complete a pending pairing (see above). `409` if it was dropped on the phone |
 

@@ -181,7 +181,7 @@ docker run -d \
      iptables -t nat -A POSTROUTING -o wg0 -j MASQUERADE
      ```
    - Router detects WAN 2 online and routes local network traffic through it.
-   - If the first available phone fails to activate (or answers `409`: it is relaying for another gateway), the next one is tried.
+   - The best available phone is used (see **Choosing a phone** below). If it fails to activate (or answers `409`: it is relaying for another gateway), the next one is tried.
 5. **Lost Phone Handover** :
    - While failover is active, the watchdog also pings the canary IP through `wg0` itself. Only the phone's relay answers it, so this checks the tunnel, the relay and the phone's cellular link end to end.
    - After 3 consecutive failed probes (`TUNNEL_FAIL_THRESHOLD`), the phone is considered lost (app crashed, empty battery, out of Wi-Fi range...). If WAN 1 is reachable again, failover simply ends; otherwise it is handed over to another available phone, or restarted on the same one if it is the only phone left (a fresh key is generated either way).
@@ -199,6 +199,15 @@ docker run -d \
    - The tunnel is never restarted when an outage starts: the router simply switches to WAN 2 (seen by the canary from `eth0`).
    - A phone that stops offering it is released right away, except while the router uses WAN 2: then it carries the outage until WAN 1 is back.
    - Failed activations are retried after 30 s, then up to every 5 minutes.
+   - A phone on battery below its minimum battery gets no hot standby tunnel (an existing one is released, and another hot phone takes over).
+8. **Choosing a phone** :
+   - Phones announce their battery level, whether they are plugged in, and their battery settings (app: *Minimum Battery*, default 20%, and *Use below the minimum if no other phone can*, default on), in the same signed beacons.
+   - When several phones are available, the gateway ranks them: battery not low first (plugged in, or at least the phone's minimum), then phones offering hot standby (their owners chose them as the backup), then plugged in, then the highest battery level. A phone low on battery is only used when no other phone can be, and only if its owner allows it (otherwise the phone also refuses to start).
+   - **During an outage, the failover moves to a better phone** when:
+     - the active phone runs low on battery (confirmed by its signed `/v1/status`) and another phone is plugged in or has at least its own minimum + 10%. If the active phone may not be used below its minimum, any phone that isn't low takes over, and with none the phone is released anyway;
+     - the active phone doesn't offer hot standby and a phone that does (and isn't low) becomes available, e.g. a phone set to *Always on* comes home. After the outage, that phone keeps the hot standby tunnel.
+   - The new phone must have announced the same state for 60 s first. The move is make-before-break: the new phone starts its cellular relay while the current one keeps carrying traffic, then `wg0` switches over and the new tunnel is checked before the old phone is released. Every phone change gives the network a new cellular public IP, so open connections reset.
+   - If the new phone fails to start or doesn't answer through the tunnel, the current phone keeps (or gets back) the tunnel, and that phone is retried after 30 s, then up to every 5 minutes.
 
 ---
 
@@ -210,7 +219,7 @@ The image includes the `wanctl` CLI for manual testing and operational control. 
 # Pair a smartphone: shows a QR code to scan in the app (phone on the gateway's Wi-Fi)
 docker exec -it wan-failover-gateway wanctl pair
 
-# List paired smartphones (name, Wi-Fi, online status) / remove one
+# List paired smartphones (name, Wi-Fi, online status, standby, battery, minimum) / remove one
 docker exec -it wan-failover-gateway wanctl phones
 docker exec -it wan-failover-gateway wanctl unpair "<phone name>"
 

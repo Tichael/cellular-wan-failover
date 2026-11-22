@@ -11,6 +11,7 @@ import com.example.cellularwanfailover.model.FailoverActionResponse
 import com.example.cellularwanfailover.model.StartFailoverRequest
 import com.example.cellularwanfailover.model.StatusResponse
 import com.example.cellularwanfailover.model.WireGuardInfo
+import com.example.cellularwanfailover.power.BatterySettings
 import com.wireguard.crypto.Key
 import io.ktor.http.ContentType
 import io.ktor.http.HttpMethod
@@ -36,6 +37,8 @@ sealed interface FailoverStartResult {
     data object Started : FailoverStartResult
     /** Another gateway is using the relay */
     data object Busy : FailoverStartResult
+    /** The phone's settings don't allow it to carry an outage now (battery below its minimum) */
+    data class Declined(val message: String) : FailoverStartResult
     data class Failed(val message: String) : FailoverStartResult
 }
 
@@ -54,6 +57,10 @@ interface FailoverControlDelegate {
     val wireguardPeerIp: String
     /** "hot" or "cold" (AuthProtocol.STANDBY_*) */
     val standby: String
+    /** Battery state of charge (%) */
+    val batteryLevel: Int
+    val isPluggedIn: Boolean
+    val batterySettings: BatterySettings
     suspend fun startFailover(gatewayPublicKey: Key, gatewayId: String): FailoverStartResult
     /** Returns false (and keeps the relay) when another gateway owns the active failover. */
     suspend fun stopFailover(gatewayId: String): Boolean
@@ -123,7 +130,11 @@ class ControlHttpServer(
                                     tunnel_ip = delegate.wireguardTunnelIp,
                                     peer_ip = delegate.wireguardPeerIp
                                 ),
-                                standby = delegate.standby
+                                standby = delegate.standby,
+                                battery = delegate.batteryLevel,
+                                plugged = delegate.isPluggedIn,
+                                min_battery = delegate.batterySettings.minBattery,
+                                last_resort = delegate.batterySettings.lastResort
                             )
                         )
                     }
@@ -143,6 +154,8 @@ class ControlHttpServer(
                                 reply(HttpStatusCode.OK, FailoverActionResponse(result = "active"))
                             FailoverStartResult.Busy ->
                                 reply(HttpStatusCode.Conflict, FailoverActionResponse(result = "busy", message = "Relay in use by another gateway"))
+                            is FailoverStartResult.Declined ->
+                                reply(HttpStatusCode.Conflict, FailoverActionResponse(result = "declined", message = result.message))
                             is FailoverStartResult.Failed ->
                                 reply(HttpStatusCode.InternalServerError, FailoverActionResponse(result = "error", message = result.message))
                         }

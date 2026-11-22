@@ -38,10 +38,10 @@ class AuthProtocolTest {
 
     @Test
     fun discoverySignature() {
-        val cold = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "cold")
-        assertEquals("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs", signer.sign(cold))
-        val hot = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "hot")
-        assertEquals("nHAaCXKjpBSE27oH7pAXu6-cZu6zq0rgfHcQUg7P_xc", signer.sign(hot))
+        val cold = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "cold", 85, false, 20, true)
+        assertEquals("zEd_0eG__PAEoFGscOeRZ-X6Og2iszvkY_J4Wrsh5dA", signer.sign(cold))
+        val hot = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "hot", 100, true, 30, false)
+        assertEquals("Rr4JEhSfOsl8tjJVxJPNsWcoPAYSCDVduOrnZZe8VC4", signer.sign(hot))
     }
 
     @Test
@@ -62,12 +62,12 @@ class AuthProtocolTest {
 
     @Test
     fun verifyRejectsWrongOrMissingSignatures() {
-        val fields = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "cold")
-        assertTrue(signer.verify("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs", fields))
-        assertFalse(signer.verify("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGt", fields))
+        val fields = AuthProtocol.discoveryFields(Vectors.GATEWAY, Vectors.PHONE, "192.168.1.23", "cold", 85, false, 20, true)
+        assertTrue(signer.verify("zEd_0eG__PAEoFGscOeRZ-X6Og2iszvkY_J4Wrsh5dA", fields))
+        assertFalse(signer.verify("zEd_0eG__PAEoFGscOeRZ-X6Og2iszvkY_J4Wrsh5dB", fields))
         assertFalse(signer.verify(null, fields))
         assertFalse(signer.verify("", fields))
-        assertFalse(memorySigner(ByteArray(32)).verify("TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs", fields))
+        assertFalse(memorySigner(ByteArray(32)).verify("zEd_0eG__PAEoFGscOeRZ-X6Og2iszvkY_J4Wrsh5dA", fields))
     }
 
     @Test

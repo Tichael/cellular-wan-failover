@@ -30,12 +30,12 @@ class TestVectors:
         fields = pairing.response_fields(GW_ID, VECTOR_PHONE, VECTOR_NONCE, 200, b'{"result":"active"}')
         assert pairing.sign(VECTOR_KEY, fields) == "Nhk2S2diibbLHvgOw8ZO5f05LA3RO9iKbalJsf2pxwk"
 
-    @pytest.mark.parametrize("standby, signature", [
-        ("cold", "TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGs"),
-        ("hot", "nHAaCXKjpBSE27oH7pAXu6-cZu6zq0rgfHcQUg7P_xc"),
+    @pytest.mark.parametrize("standby, battery, plugged, min_battery, last_resort, signature", [
+        ("cold", 85, False, 20, True, "zEd_0eG__PAEoFGscOeRZ-X6Og2iszvkY_J4Wrsh5dA"),
+        ("hot", 100, True, 30, False, "Rr4JEhSfOsl8tjJVxJPNsWcoPAYSCDVduOrnZZe8VC4"),
     ])
-    def test_discovery_signature(self, standby, signature):
-        fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23", standby)
+    def test_discovery_signature(self, standby, battery, plugged, min_battery, last_resort, signature):
+        fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23", standby, battery, plugged, min_battery, last_resort)
         assert pairing.sign(VECTOR_KEY, fields) == signature
 
     def test_replace_signature(self):
@@ -55,12 +55,12 @@ class TestVectors:
 
 class TestSigning:
     def test_verify_round_trip(self):
-        fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "10.0.0.2", "cold")
+        fields = pairing.discovery_fields(GW_ID, VECTOR_PHONE, "10.0.0.2", "cold", 85, False, 20, True)
         assert pairing.verify(VECTOR_KEY, pairing.sign(VECTOR_KEY, fields), fields)
 
-    @pytest.mark.parametrize("signature", [None, "", "x", 42, "TMjo4b_lKYB5BlcarcSHHhf8C7aSvSUhYqEjFcd1cGt"])
+    @pytest.mark.parametrize("signature", [None, "", "x", 42, "zEd_0eG__PAEoFGscOeRZ-X6Og2iszvkY_J4Wrsh5dB"])
     def test_verify_rejects(self, signature):
-        assert not pairing.verify(VECTOR_KEY, signature, pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23", "cold"))
+        assert not pairing.verify(VECTOR_KEY, signature, pairing.discovery_fields(GW_ID, VECTOR_PHONE, "192.168.1.23", "cold", 85, False, 20, True))
 
     def test_fields_cannot_be_shifted(self):
         # A newline inside a field could make two different messages sign the same bytes
