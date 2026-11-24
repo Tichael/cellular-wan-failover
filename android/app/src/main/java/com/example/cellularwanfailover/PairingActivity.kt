@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -73,6 +74,9 @@ class PairingActivity : ComponentActivity() {
     private var link by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Transparent system bars whose icons follow the light/dark theme (the default left
+        // white icons on a white status bar); Scaffold pads the content clear of them
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         link = intent?.dataString
         val controller = FailoverController.getInstance(this)

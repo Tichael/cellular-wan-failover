@@ -10,6 +10,8 @@ import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -59,6 +61,9 @@ class MainActivity : ComponentActivity() {
     private lateinit var controller: FailoverController
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Transparent system bars whose icons follow the light/dark theme (the default left
+        // white icons on a white status bar); Scaffold pads the content clear of them
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         controller = FailoverController.getInstance(this)
 
@@ -138,6 +143,8 @@ fun App(controller: FailoverController, onRequestIgnoreBattery: () -> Unit) {
     )
 
     var tab by rememberSaveable { mutableStateOf(AppTab.STATUS) }
+    // Back from Setup or Diagnostics returns to Status; from Status it leaves the app
+    BackHandler(enabled = tab != AppTab.STATUS) { tab = AppTab.STATUS }
 
     val actions = AppActions(
         openTab = { tab = it },
