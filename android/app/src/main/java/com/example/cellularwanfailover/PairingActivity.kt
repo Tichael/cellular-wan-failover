@@ -25,6 +25,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import com.example.cellularwanfailover.ui.theme.AppTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -80,7 +81,7 @@ class PairingActivity : ComponentActivity() {
         FailoverForegroundService.startService(this)
 
         setContent {
-            MaterialTheme {
+            AppTheme {
                 PairingScreen(
                     controller = controller,
                     link = link,
