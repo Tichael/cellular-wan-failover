@@ -3,51 +3,29 @@ package com.example.cellularwanfailover
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.location.LocationManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.PowerManager
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Badge
+import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.NavigationBar
+import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
-import androidx.compose.material3.Slider
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -56,42 +34,36 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.LifecycleResumeEffect
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.cellularwanfailover.controller.FailoverController
-import com.example.cellularwanfailover.model.CellularState
-import com.example.cellularwanfailover.model.FailoverState
-import com.example.cellularwanfailover.model.LogEntry
-import com.example.cellularwanfailover.auth.GatewayPairing
-import com.example.cellularwanfailover.auth.PairingInvite
-import com.example.cellularwanfailover.auth.PairingState
-import com.example.cellularwanfailover.model.WifiNetworkInfo
-import com.example.cellularwanfailover.power.BatterySettings
-import com.example.cellularwanfailover.power.StandbyMode
 import com.example.cellularwanfailover.service.FailoverForegroundService
-import com.google.mlkit.vision.barcode.common.Barcode
-import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
-import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
+import com.example.cellularwanfailover.ui.AppActions
+import com.example.cellularwanfailover.ui.AppState
+import com.example.cellularwanfailover.ui.AppTab
+import com.example.cellularwanfailover.ui.PermissionStatus
+import com.example.cellularwanfailover.ui.SetupIssue
+import com.example.cellularwanfailover.ui.components.AppIcons
+import com.example.cellularwanfailover.ui.diagnostics.DiagnosticsScreen
+import com.example.cellularwanfailover.ui.setup.SetupScreen
+import com.example.cellularwanfailover.ui.status.StatusScreen
+import com.example.cellularwanfailover.ui.theme.AppTheme
 import kotlinx.coroutines.launch
-import java.text.DateFormat
-import java.util.Date
-import java.util.Locale
 
 class MainActivity : ComponentActivity() {
 
     private lateinit var controller: FailoverController
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Transparent system bars whose icons follow the light/dark theme (the default left
+        // white icons on a white status bar); Scaffold pads the content clear of them
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         controller = FailoverController.getInstance(this)
 
@@ -99,574 +71,141 @@ class MainActivity : ComponentActivity() {
         FailoverForegroundService.startService(this)
 
         setContent {
-            MaterialTheme {
-                MainScreen(
-                    controller = controller,
-                    onStartService = { FailoverForegroundService.startService(this) },
-                    onStopService = { FailoverForegroundService.stopService(this) },
-                    onRequestIgnoreBattery = { requestIgnoreBatteryOptimizations() }
-                )
+            AppTheme {
+                App(controller = controller, onRequestIgnoreBattery = { requestIgnoreBatteryOptimizations() })
             }
         }
     }
 
     private fun requestIgnoreBatteryOptimizations() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                try {
-                    val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                    startActivity(intent)
-                } catch (e: Exception) {
-                    val fallbackIntent = Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
-                    startActivity(fallbackIntent)
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+            try {
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.parse("package:$packageName")
                 }
+                startActivity(intent)
+            } catch (e: Exception) {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
             }
         }
     }
 }
 
 @Composable
-fun MainScreen(
-    controller: FailoverController,
-    onStartService: () -> Unit,
-    onStopService: () -> Unit,
-    onRequestIgnoreBattery: () -> Unit
-) {
-    val failoverState by controller.failoverState.collectAsStateWithLifecycle()
-    val cellularState by controller.cellularState.collectAsStateWithLifecycle()
-    val wifiIp by controller.wifiIp.collectAsStateWithLifecycle()
-    val bytesTransmitted by controller.bytesTransmitted.collectAsStateWithLifecycle()
-    val logs by controller.logs.collectAsStateWithLifecycle()
-    val isNetworkTrusted by controller.isNetworkTrusted.collectAsStateWithLifecycle()
-    val currentWifiNetwork by controller.currentWifiNetwork.collectAsStateWithLifecycle()
-    val pairings by controller.pairings.collectAsStateWithLifecycle()
-    val pairingState by controller.pairingState.collectAsStateWithLifecycle()
-    val standbyMode by controller.standbyMode.collectAsStateWithLifecycle()
-    val standbyHot by controller.standbyHot.collectAsStateWithLifecycle()
-    val pluggedIn by controller.pluggedIn.collectAsStateWithLifecycle()
-    val batteryLevel by controller.batteryLevelState.collectAsStateWithLifecycle()
-    val batterySettings by controller.batterySettingsState.collectAsStateWithLifecycle()
-
+fun App(controller: FailoverController, onRequestIgnoreBattery: () -> Unit) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    // Request permissions for notifications and Wi-Fi SSID access (location)
-    val permissionsLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) {
-        controller.refreshWifiNetworkInfo()
-    }
-
-    // "Allow all the time": lets the app read the Wi-Fi name while locked / in the background,
-    // so it can verify a trusted network (e.g. after coming home) without being opened
-    var hasForegroundLocation by remember { mutableStateOf(hasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)) }
-    var hasBackgroundLocation by remember { mutableStateOf(hasBackgroundLocationPermission(context)) }
-    val backgroundLocationLauncher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { granted ->
-        hasBackgroundLocation = granted
-        controller.refreshWifiNetworkInfo()
-    }
-    // Re-check when returning from the system permission screen
+    // Re-read on resume: the user may come back from a system permission or settings screen
+    var permissions by remember { mutableStateOf(readPermissionStatus(context)) }
     LifecycleResumeEffect(Unit) {
-        hasForegroundLocation = hasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
-        hasBackgroundLocation = hasBackgroundLocationPermission(context)
+        permissions = readPermissionStatus(context)
+        controller.refreshWifiNetworkInfo()
         onPauseOrDispose { }
     }
 
+    val permissionsLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
+        permissions = readPermissionStatus(context)
+        controller.refreshWifiNetworkInfo()
+    }
+    // "Allow all the time": lets the app read the Wi-Fi name while locked / in the background,
+    // so it can verify a trusted network (e.g. after coming home) without being opened
+    val backgroundLocationLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        permissions = readPermissionStatus(context)
+        controller.refreshWifiNetworkInfo()
+    }
+    var showBackgroundLocationDialog by remember { mutableStateOf(false) }
+
     LaunchedEffect(Unit) {
-        val perms = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            perms.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
+        val perms = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) perms.add(Manifest.permission.POST_NOTIFICATIONS)
         permissionsLauncher.launch(perms.toTypedArray())
     }
 
+    val state = AppState(
+        failoverState = controller.failoverState.collectAsStateWithLifecycle().value,
+        cellularState = controller.cellularState.collectAsStateWithLifecycle().value,
+        wifiIp = controller.wifiIp.collectAsStateWithLifecycle().value,
+        currentWifi = controller.currentWifiNetwork.collectAsStateWithLifecycle().value,
+        isNetworkTrusted = controller.isNetworkTrusted.collectAsStateWithLifecycle().value,
+        bytesTransmitted = controller.bytesTransmitted.collectAsStateWithLifecycle().value,
+        logs = controller.logs.collectAsStateWithLifecycle().value,
+        pairings = controller.pairings.collectAsStateWithLifecycle().value,
+        pairingState = controller.pairingState.collectAsStateWithLifecycle().value,
+        standbyMode = controller.standbyMode.collectAsStateWithLifecycle().value,
+        standbyHot = controller.standbyHot.collectAsStateWithLifecycle().value,
+        pluggedIn = controller.pluggedIn.collectAsStateWithLifecycle().value,
+        batteryLevel = controller.batteryLevelState.collectAsStateWithLifecycle().value,
+        batterySettings = controller.batterySettingsState.collectAsStateWithLifecycle().value,
+        publicKey = controller.wireguardPublicKey,
+        permissions = permissions
+    )
+
+    var tab by rememberSaveable { mutableStateOf(AppTab.STATUS) }
+    // Back from Setup or Diagnostics returns to Status; from Status it leaves the app
+    BackHandler(enabled = tab != AppTab.STATUS) { tab = AppTab.STATUS }
+
+    val actions = AppActions(
+        openTab = { tab = it },
+        setStandbyMode = controller::setStandbyMode,
+        setBatterySettings = controller::setBatterySettings,
+        stopFailover = { scope.launch { controller.stopFailover() } },
+        clearLogs = controller::clearLogs,
+        openPairingLink = { link -> PairingActivity.start(context, link) },
+        cancelPairing = controller::cancelPairing,
+        acknowledgePairingResult = controller::acknowledgePairingResult,
+        removeGateway = controller::removeGateway,
+        fixIssue = { issue ->
+            when (issue) {
+                SetupIssue.LOCATION_PERMISSION -> permissionsLauncher.launch(
+                    arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+                )
+                SetupIssue.LOCATION_SERVICES -> context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                SetupIssue.BACKGROUND_LOCATION -> showBackgroundLocationDialog = true
+                SetupIssue.BATTERY_OPTIMIZATION -> onRequestIgnoreBattery()
+            }
+        },
+        requestNotifications = {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                permissionsLauncher.launch(arrayOf(Manifest.permission.POST_NOTIFICATIONS))
+            }
+        }
+    )
+
     Scaffold(
         modifier = Modifier.fillMaxSize(),
-        containerColor = MaterialTheme.colorScheme.background
-    ) { paddingValues ->
-        // Scrolls: the cards together are taller than most screens
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(paddingValues)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(16.dp)
-        ) {
-            // Header
-            HeaderView(
-                failoverState = failoverState,
-                isNetworkTrusted = isNetworkTrusted
-            )
-
-            // Status Card
-            StatusCard(
-                failoverState = failoverState,
-                cellularState = cellularState,
-                wifiIp = wifiIp,
-                currentWifi = currentWifiNetwork,
-                isNetworkTrusted = isNetworkTrusted,
-                bytesTransmitted = bytesTransmitted,
-                wireguardPublicKey = controller.wireguardPublicKey,
-                standbyHot = standbyHot
-            )
-
-            // Paired Gateways Card (each pairing trusts the Wi-Fi network it was made on)
-            GatewaysCard(
-                isNetworkTrusted = isNetworkTrusted,
-                currentWifi = currentWifiNetwork,
-                pairings = pairings,
-                pairingState = pairingState,
-                onPairingLink = { link -> PairingActivity.start(context, link) },
-                onCancelPairing = { controller.cancelPairing() },
-                onDismissPairingResult = { controller.acknowledgePairingResult() },
-                onRemoveGateway = { gatewayId -> controller.removeGateway(gatewayId) },
-                onRequestLocationPermission = {
-                    permissionsLauncher.launch(
-                        arrayOf(
-                            Manifest.permission.ACCESS_FINE_LOCATION,
-                            Manifest.permission.ACCESS_COARSE_LOCATION
-                        )
-                    )
-                },
-                showBackgroundLocationWarning = hasForegroundLocation && !hasBackgroundLocation,
-                onRequestBackgroundLocation = {
-                    // Android 11+ opens the app's location settings, where "Allow all the time" is chosen
-                    backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-                }
-            )
-
-            // Controls Card
-            ControlsCard(
-                failoverState = failoverState,
-                isNetworkTrusted = isNetworkTrusted,
-                standbyMode = standbyMode,
-                standbyHot = standbyHot,
-                pluggedIn = pluggedIn,
-                onStandbyModeChange = { controller.setStandbyMode(it) },
-                batteryLevel = batteryLevel,
-                batterySettings = batterySettings,
-                onBatterySettingsChange = { controller.setBatterySettings(it) },
-                onStopFailover = {
-                    scope.launch { controller.stopFailover() }
-                },
-                onRequestIgnoreBattery = onRequestIgnoreBattery
-            )
-
-            // Real-time Event Log Viewer
-            LogViewerCard(
-                logs = logs,
-                onClearLogs = { controller.clearLogs() },
-                modifier = Modifier.height(320.dp)
-            )
-        }
-    }
-}
-
-@Composable
-fun HeaderView(
-    failoverState: FailoverState,
-    isNetworkTrusted: Boolean
-) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column {
-            Text(
-                text = "Cellular WAN Failover",
-                fontSize = 20.sp,
-                fontWeight = FontWeight.Bold,
-                color = MaterialTheme.colorScheme.onBackground
-            )
-            Text(
-                text = "Local WireGuard Gateway",
-                fontSize = 13.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-        }
-
-        val (badgeColor, badgeText) = if (!isNetworkTrusted) {
-            Color(0xFFE65100) to "PAUSED (NOT PAIRED)"
-        } else {
-            when (failoverState) {
-                FailoverState.IDLE -> Color(0xFF689F38) to "STANDBY"
-                FailoverState.CONNECTING -> Color(0xFFF57C00) to "CONNECTING"
-                FailoverState.ACTIVE -> Color(0xFFD32F2F) to "FAILOVER ACTIVE"
-                FailoverState.ERROR -> Color(0xFFC2185B) to "ERROR"
-            }
-        }
-
-        Box(
-            modifier = Modifier
-                .clip(RoundedCornerShape(12.dp))
-                .background(badgeColor.copy(alpha = 0.15f))
-                .padding(horizontal = 10.dp, vertical = 5.dp)
-        ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(
-                    modifier = Modifier
-                        .size(8.dp)
-                        .clip(CircleShape)
-                        .background(badgeColor)
-                )
-                Spacer(modifier = Modifier.width(6.dp))
-                Text(
-                    text = badgeText,
-                    color = badgeColor,
-                    fontSize = 11.sp,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun StatusCard(
-    failoverState: FailoverState,
-    cellularState: CellularState,
-    wifiIp: String?,
-    currentWifi: WifiNetworkInfo?,
-    isNetworkTrusted: Boolean,
-    bytesTransmitted: Long,
-    wireguardPublicKey: String,
-    standbyHot: Boolean
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)
-    ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                text = "Network Status",
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 15.sp,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
-            )
-
-            HorizontalDivider()
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "Wi-Fi Interface (LAN):", fontSize = 13.sp)
-                val wifiLabel = when {
-                    wifiIp != null && currentWifi?.ssid != null && currentWifi.ssid != "<unknown ssid>" ->
-                        "$wifiIp (${currentWifi.ssid})"
-                    wifiIp != null -> wifiIp
-                    else -> "Disconnected"
-                }
-                Text(
-                    text = wifiLabel,
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    color = if (wifiIp != null) MaterialTheme.colorScheme.primary else Color.Gray
-                )
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "Trusted Wi-Fi Gating:", fontSize = 13.sp)
-                Text(
-                    text = if (isNetworkTrusted) "Approved (Trusted Wi-Fi)" else "Paused (Untrusted Network)",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    color = if (isNetworkTrusted) Color(0xFF388E3C) else Color(0xFFE65100)
-                )
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "Cellular Network (WAN):", fontSize = 13.sp)
-                val (cellText, cellColor) = when (cellularState) {
-                    CellularState.DISCONNECTED -> "Standby / Inactive" to Color.Gray
-                    CellularState.CONNECTING -> "Connecting..." to Color(0xFFF57C00)
-                    CellularState.CONNECTED -> "Ready / Connected" to Color(0xFF388E3C)
-                }
-                Text(text = cellText, fontWeight = FontWeight.Bold, fontSize = 13.sp, color = cellColor)
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "Standby:", fontSize = 13.sp)
-                Text(
-                    text = if (standbyHot) "Hot (always-on tunnel)" else "Cold (on demand)",
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    color = if (standbyHot) Color(0xFF388E3C) else Color.Gray
-                )
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "WireGuard Relay:", fontSize = 13.sp)
-                val wgText = when {
-                    failoverState == FailoverState.ACTIVE -> "Listening UDP :51820"
-                    !isNetworkTrusted -> "Halted (Untrusted Network)"
-                    else -> "Standby (Port :51820)"
-                }
-                Text(
-                    text = wgText,
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = if (failoverState == FailoverState.ACTIVE) Color(0xFF388E3C) else Color.Gray
-                )
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "Phone Public Key:", fontSize = 13.sp)
-                Text(
-                    text = wireguardPublicKey.take(12) + "...",
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Medium
-                )
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "HTTP Control API:", fontSize = 13.sp)
-                Text(
-                    text = if (isNetworkTrusted) "Port 8989 (Active)" else "Port 8989 (Halted / Paused)",
-                    fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium,
-                    color = if (isNetworkTrusted) MaterialTheme.colorScheme.onSurfaceVariant else Color(0xFFE65100)
-                )
-            }
-
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(text = "Relayed Data:", fontSize = 13.sp)
-                Text(
-                    text = formatBytes(bytesTransmitted),
-                    fontWeight = FontWeight.Bold,
-                    fontSize = 13.sp,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        }
-    }
-}
-
-@Composable
-fun GatewaysCard(
-    isNetworkTrusted: Boolean,
-    currentWifi: WifiNetworkInfo?,
-    pairings: List<GatewayPairing>,
-    pairingState: PairingState,
-    onPairingLink: (String) -> Unit,
-    onCancelPairing: () -> Unit,
-    onDismissPairingResult: () -> Unit,
-    onRemoveGateway: (String) -> Unit,
-    onRequestLocationPermission: () -> Unit,
-    showBackgroundLocationWarning: Boolean,
-    onRequestBackgroundLocation: () -> Unit
-) {
-    val context = LocalContext.current
-    var showBackgroundLocationDialog by remember { mutableStateOf(false) }
-    var showPasteDialog by remember { mutableStateOf(false) }
-    var invalidCodeMessage by remember { mutableStateOf<String?>(null) }
-    var gatewayToRemove by remember { mutableStateOf<GatewayPairing?>(null) }
-
-    fun openLink(text: String) {
-        if (PairingInvite.parse(text) != null) {
-            onPairingLink(text.trim())
-        } else {
-            invalidCodeMessage = "This isn't a gateway pairing code. On the gateway, run 'wanctl pair' and scan its QR code."
-        }
-    }
-
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Paired Gateways",
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 15.sp
-                )
-                val (badgeBg, badgeFg, badgeLabel) = when {
-                    currentWifi == null -> Triple(Color(0xFFE0E0E0), Color(0xFF616161), "NO WI-FI")
-                    isNetworkTrusted -> Triple(Color(0xFFE8F5E9), Color(0xFF2E7D32), "PAIRED HERE")
-                    else -> Triple(Color(0xFFFFEBEE), Color(0xFFC62828), "NOT PAIRED HERE")
-                }
-                Box(
-                    modifier = Modifier
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(badgeBg)
-                        .padding(horizontal = 8.dp, vertical = 3.dp)
-                ) {
-                    Text(
-                        text = badgeLabel,
-                        color = badgeFg,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                }
-            }
-
-            // Current Wi-Fi info line
-            val currentSsid = currentWifi?.ssid
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(text = "Current Network:", fontSize = 13.sp, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                if (currentSsid == "<unknown ssid>") {
-                    val isPermissionGranted = hasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION)
-                    TextButton(onClick = {
-                        if (isPermissionGranted) {
-                            context.startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
-                        } else {
-                            onRequestLocationPermission()
-                        }
-                    }) {
-                        Text(if (isPermissionGranted) "Enable Location Services" else "Grant Location Permission", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-                    }
-                } else {
-                    Text(
-                        text = currentSsid ?: "Not connected",
-                        fontWeight = FontWeight.Medium,
-                        fontSize = 13.sp
-                    )
-                }
-            }
-
-            if (showBackgroundLocationWarning) {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(8.dp))
-                        .background(Color(0xFFFFF8E1))
-                        .padding(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    Text(
-                        text = "Background Wi-Fi check is off",
-                        fontWeight = FontWeight.SemiBold,
-                        fontSize = 13.sp,
-                        color = Color(0xFF8D6E00)
-                    )
-                    Text(
-                        text = "Android only shows the Wi-Fi name while the app is open. When the phone " +
-                            "reconnects to Wi-Fi while locked, failover stays paused until you open the app.",
-                        fontSize = 12.sp,
-                        color = Color(0xFF5D4600)
-                    )
-                    TextButton(onClick = { showBackgroundLocationDialog = true }) {
-                        Text("Allow all the time", fontSize = 12.sp, color = MaterialTheme.colorScheme.primary)
-                    }
-                }
-            }
-
-            HorizontalDivider()
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Button(
-                    onClick = {
-                        scanPairingQr(
-                            context = context,
-                            onResult = { openLink(it) },
-                            onError = { invalidCodeMessage = it }
-                        )
-                    },
-                    modifier = Modifier.weight(1f)
-                ) {
-                    Text("Scan Gateway QR", fontSize = 12.sp)
-                }
-
-                OutlinedButton(onClick = { showPasteDialog = true }) {
-                    Text("Paste Link", fontSize = 12.sp)
-                }
-            }
-
-            // Pairing in progress (or its outcome) when its screen was left
-            when (pairingState) {
-                is PairingState.Waiting -> PairingStatusRow(
-                    text = "Pairing with ${pairingState.gatewayName} on Wi-Fi '${pairingState.ssid}': waiting for the gateway...",
-                    color = Color(0xFF1565C0),
-                    action = "Cancel" to onCancelPairing,
-                    showProgress = true
-                )
-                is PairingState.Failed -> PairingStatusRow(
-                    text = "Pairing with ${pairingState.gatewayName} failed: ${pairingState.reason}",
-                    color = MaterialTheme.colorScheme.error,
-                    action = "Dismiss" to onDismissPairingResult
-                )
-                is PairingState.Paired -> PairingStatusRow(
-                    text = "Paired with ${pairingState.gatewayName} on Wi-Fi '${pairingState.ssid}'.",
-                    color = Color(0xFF2E7D32),
-                    action = "OK" to onDismissPairingResult
-                )
-                PairingState.Idle -> Unit
-            }
-
-            if (pairings.isEmpty()) {
-                Text(
-                    text = "No gateway paired yet. On the gateway, run 'docker exec -it wan-failover-gateway wanctl pair' " +
-                        "and scan the QR code while this phone is on the same Wi-Fi network.",
-                    color = Color.Gray,
-                    fontSize = 12.sp,
-                    modifier = Modifier.padding(vertical = 4.dp)
-                )
-            } else {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 160.dp)
-                        .verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(4.dp)
-                ) {
-                    pairings.forEach { pairing ->
-                        val onThisWifi = pairing.ssid == currentSsid
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(8.dp))
-                                .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                .padding(horizontal = 10.dp, vertical = 6.dp),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = pairing.gatewayName,
-                                    fontWeight = FontWeight.SemiBold,
-                                    fontSize = 13.sp
-                                )
-                                Text(
-                                    text = "Wi-Fi: ${pairing.ssid}" + if (onThisWifi) " (connected)" else "",
-                                    fontSize = 11.sp,
-                                    color = if (onThisWifi) Color(0xFF2E7D32) else Color.Gray
-                                )
-                                Text(
-                                    text = "Paired " + DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT)
-                                        .format(Date(pairing.pairedAt)),
-                                    fontSize = 10.sp,
-                                    color = Color.Gray
-                                )
+        containerColor = MaterialTheme.colorScheme.background,
+        bottomBar = {
+            NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
+                AppTab.entries.forEach { item ->
+                    NavigationBarItem(
+                        selected = tab == item,
+                        onClick = { tab = item },
+                        label = { Text(item.label) },
+                        icon = {
+                            val icon = when (item) {
+                                AppTab.STATUS -> AppIcons.Shield
+                                AppTab.SETUP -> AppIcons.Sliders
+                                AppTab.DIAGNOSTICS -> AppIcons.Pulse
                             }
-                            TextButton(onClick = { gatewayToRemove = pairing }) {
-                                Text("Remove", color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+                            // Setup carries a dot while something keeps the app from running on its own
+                            if (item == AppTab.SETUP && state.issues.isNotEmpty()) {
+                                BadgedBox(badge = { Badge() }) { Icon(icon, contentDescription = null) }
+                            } else {
+                                Icon(icon, contentDescription = null)
                             }
                         }
-                    }
+                    )
                 }
             }
+        }
+    ) { padding ->
+        val modifier = Modifier.padding(padding)
+        when (tab) {
+            AppTab.STATUS -> StatusScreen(state, actions, modifier)
+            AppTab.SETUP -> SetupScreen(state, actions, modifier)
+            AppTab.DIAGNOSTICS -> DiagnosticsScreen(state, actions, modifier)
         }
     }
 
@@ -680,402 +219,35 @@ fun GatewaysCard(
                         "closed, Android requires location access set to \"Allow all the time\".\n\n" +
                         "The app only reads the Wi-Fi name. It doesn't use or store your location.\n\n" +
                         "On the next screen, choose \"Allow all the time\".",
-                    fontSize = 13.sp
+                    fontSize = 14.sp
                 )
             },
             confirmButton = {
                 Button(onClick = {
                     showBackgroundLocationDialog = false
-                    onRequestBackgroundLocation()
-                }) {
-                    Text("Continue")
-                }
+                    // Android 11+ opens the app's location settings, where "Allow all the time" is chosen
+                    backgroundLocationLauncher.launch(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+                }) { Text("Continue") }
             },
-            dismissButton = {
-                TextButton(onClick = { showBackgroundLocationDialog = false }) {
-                    Text("Not now")
-                }
-            }
-        )
-    }
-
-    if (showPasteDialog) {
-        var input by remember { mutableStateOf("") }
-        AlertDialog(
-            onDismissRequest = { showPasteDialog = false },
-            title = { Text("Paste Pairing Link") },
-            text = {
-                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text("Paste the link printed by 'wanctl pair' on the gateway:", fontSize = 13.sp)
-                    OutlinedTextField(
-                        value = input,
-                        onValueChange = { input = it },
-                        modifier = Modifier.fillMaxWidth(),
-                        placeholder = { Text("wanfailover://pair?...") },
-                        maxLines = 4
-                    )
-                }
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        showPasteDialog = false
-                        openLink(input)
-                    },
-                    enabled = input.isNotBlank()
-                ) {
-                    Text("Continue")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { showPasteDialog = false }) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
-    invalidCodeMessage?.let { message ->
-        AlertDialog(
-            onDismissRequest = { invalidCodeMessage = null },
-            title = { Text("Can't pair") },
-            text = { Text(message, fontSize = 13.sp) },
-            confirmButton = {
-                TextButton(onClick = { invalidCodeMessage = null }) { Text("OK") }
-            }
-        )
-    }
-
-    gatewayToRemove?.let { pairing ->
-        AlertDialog(
-            onDismissRequest = { gatewayToRemove = null },
-            title = { Text("Remove ${pairing.gatewayName}?") },
-            text = {
-                Text(
-                    "This gateway won't be able to use the phone anymore, and Wi-Fi '${pairing.ssid}' is no longer " +
-                        "trusted unless another gateway is paired on it. Also run 'wanctl unpair' on the gateway.",
-                    fontSize = 13.sp
-                )
-            },
-            confirmButton = {
-                Button(
-                    onClick = {
-                        onRemoveGateway(pairing.gatewayId)
-                        gatewayToRemove = null
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = MaterialTheme.colorScheme.error)
-                ) {
-                    Text("Remove")
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = { gatewayToRemove = null }) { Text("Cancel") }
-            }
+            dismissButton = { TextButton(onClick = { showBackgroundLocationDialog = false }) { Text("Not now") } }
         )
     }
 }
 
-@Composable
-private fun PairingStatusRow(text: String, color: Color, action: Pair<String, () -> Unit>, showProgress: Boolean = false) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clip(RoundedCornerShape(8.dp))
-            .background(color.copy(alpha = 0.08f))
-            .padding(horizontal = 10.dp, vertical = 4.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
-    ) {
-        if (showProgress) CircularProgressIndicator(modifier = Modifier.size(16.dp), strokeWidth = 2.dp, color = color)
-        Text(text = text, fontSize = 12.sp, color = color, modifier = Modifier.weight(1f))
-        TextButton(onClick = action.second) { Text(action.first, fontSize = 12.sp) }
-    }
-}
-
-/** Google Code Scanner: Play services shows the camera UI, so the app needs no camera permission. */
-private fun scanPairingQr(context: Context, onResult: (String) -> Unit, onError: (String) -> Unit) {
-    try {
-        val options = GmsBarcodeScannerOptions.Builder()
-            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-            .enableAutoZoom()
-            .build()
-        GmsBarcodeScanning.getClient(context, options)
-            .startScan()
-            .addOnSuccessListener { barcode ->
-                val raw = barcode.rawValue
-                if (raw.isNullOrBlank()) onError("The scanned QR code is empty.") else onResult(raw)
-            }
-            .addOnFailureListener { e -> onError("Couldn't scan: ${e.message ?: "scanner unavailable"}") }
-        // Closing the scanner (back) is a cancel: nothing to report
-    } catch (e: Exception) {
-        onError("Google Code Scanner is unavailable: ${e.message}. Use 'Paste Link' instead.")
-    }
-}
-
-@Composable
-fun BatterySettingsSection(
-    batteryLevel: Int,
-    pluggedIn: Boolean,
-    settings: BatterySettings,
-    onChange: (BatterySettings) -> Unit
-) {
-    // Follows the slider while dragging; saved (and sent to the gateway) when released
-    var draft by remember(settings.minBattery) { mutableStateOf(settings.minBattery.toFloat()) }
-    Text(
-        text = "Minimum Battery: ${draft.toInt()}%",
-        fontWeight = FontWeight.SemiBold,
-        fontSize = 15.sp
+private fun readPermissionStatus(context: Context): PermissionStatus {
+    val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+    val locationManager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+    return PermissionStatus(
+        location = hasPermission(context, Manifest.permission.ACCESS_FINE_LOCATION),
+        locationServicesOn = locationManager.isLocationEnabled,
+        // Background location only exists on Android 10+; before that, foreground location covers it
+        backgroundLocation = Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
+            hasPermission(context, Manifest.permission.ACCESS_BACKGROUND_LOCATION),
+        notifications = Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            hasPermission(context, Manifest.permission.POST_NOTIFICATIONS),
+        batteryUnrestricted = powerManager.isIgnoringBatteryOptimizations(context.packageName)
     )
-    Slider(
-        value = draft,
-        onValueChange = { draft = it },
-        onValueChangeFinished = { onChange(settings.copy(minBattery = draft.toInt())) },
-        valueRange = 0f..BatterySettings.MAX_MIN_BATTERY.toFloat(),
-        steps = BatterySettings.MAX_MIN_BATTERY / BatterySettings.MIN_BATTERY_STEP - 1
-    )
-    Text(
-        text = "Battery now: $batteryLevel%" + (if (pluggedIn) " (plugged in)" else "") +
-            ". Below the minimum on battery, the gateway uses another phone if it has one and gives this one no always-on tunnel.",
-        color = Color.Gray,
-        fontSize = 12.sp
-    )
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(
-            text = "Use below the minimum if no other phone can",
-            fontSize = 13.sp,
-            modifier = Modifier.weight(1f)
-        )
-        Switch(
-            checked = settings.lastResort,
-            onCheckedChange = { onChange(settings.copy(lastResort = it)) }
-        )
-    }
-    Text(
-        text = if (settings.lastResort) {
-            "Keeps the internet up during an outage even when the battery is low."
-        } else {
-            "Below the minimum, this phone never carries an outage: the house stays offline if no other phone can."
-        },
-        color = Color.Gray,
-        fontSize = 12.sp
-    )
-}
-
-@Composable
-fun ControlsCard(
-    failoverState: FailoverState,
-    isNetworkTrusted: Boolean,
-    standbyMode: StandbyMode,
-    standbyHot: Boolean,
-    pluggedIn: Boolean,
-    onStandbyModeChange: (StandbyMode) -> Unit,
-    batteryLevel: Int,
-    batterySettings: BatterySettings,
-    onBatterySettingsChange: (BatterySettings) -> Unit,
-    onStopFailover: () -> Unit,
-    onRequestIgnoreBattery: () -> Unit
-) {
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
-    ) {
-        Column(modifier = Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text(
-                text = "Standby Mode",
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 15.sp
-            )
-
-            val modes = listOf(
-                StandbyMode.ON_DEMAND to "On demand",
-                StandbyMode.WHILE_PLUGGED to "Plugged in",
-                StandbyMode.ALWAYS to "Always"
-            )
-            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                modes.forEachIndexed { index, (mode, label) ->
-                    SegmentedButton(
-                        selected = standbyMode == mode,
-                        onClick = { onStandbyModeChange(mode) },
-                        shape = SegmentedButtonDefaults.itemShape(index = index, count = modes.size)
-                    ) {
-                        Text(label, fontSize = 12.sp)
-                    }
-                }
-            }
-            Text(
-                text = when (standbyMode) {
-                    StandbyMode.ON_DEMAND ->
-                        "Cellular starts only when the gateway detects an outage (saves battery and data)."
-                    StandbyMode.WHILE_PLUGGED ->
-                        "Always-on tunnel while plugged in (" + (if (pluggedIn) "plugged in now" else "on battery now") +
-                            "), on demand on battery. The router sees its backup WAN online and switches faster."
-                    StandbyMode.ALWAYS ->
-                        "Always-on tunnel, even on battery. The router sees its backup WAN online and switches faster, " +
-                            "but the phone keeps cellular data up."
-                },
-                color = Color.Gray,
-                fontSize = 12.sp
-            )
-
-            HorizontalDivider()
-
-            BatterySettingsSection(batteryLevel, pluggedIn, batterySettings, onBatterySettingsChange)
-
-            HorizontalDivider()
-
-            Text(
-                text = "Manual Controls",
-                fontWeight = FontWeight.SemiBold,
-                fontSize = 15.sp
-            )
-
-            when {
-                failoverState == FailoverState.ACTIVE -> {
-                    Button(
-                        onClick = onStopFailover,
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
-                    ) {
-                        Text("Stop Failover Relay")
-                    }
-                }
-                failoverState == FailoverState.CONNECTING -> {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text("Activating cellular relay...", fontSize = 13.sp)
-                    }
-                }
-                else -> {
-                    Text(
-                        text = if (isNetworkTrusted && standbyHot) {
-                            "Hot standby: waiting for the gateway to bring up the always-on tunnel."
-                        } else if (isNetworkTrusted) {
-                            "Failover is started by the gateway when it detects a WAN outage."
-                        } else {
-                            "Paused: connect to a trusted Wi-Fi network."
-                        },
-                        color = Color.Gray,
-                        fontSize = 12.sp
-                    )
-                }
-            }
-
-            OutlinedButton(
-                onClick = onRequestIgnoreBattery,
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("Disable Battery Optimizations", fontSize = 13.sp)
-            }
-        }
-    }
-}
-
-@Composable
-fun LogViewerCard(
-    logs: List<LogEntry>,
-    onClearLogs: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    val listState = rememberLazyListState()
-
-    LaunchedEffect(logs.size) {
-        if (logs.isNotEmpty()) {
-            listState.animateScrollToItem(logs.size - 1)
-        }
-    }
-
-    Card(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = Color(0xFF1E1E1E))
-    ) {
-        Column(modifier = Modifier.fillMaxSize().padding(10.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = "Event Log (${logs.size})",
-                    color = Color.White,
-                    fontWeight = FontWeight.SemiBold,
-                    fontSize = 14.sp
-                )
-                Button(
-                    onClick = onClearLogs,
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF333333)),
-                    shape = RoundedCornerShape(8.dp)
-                ) {
-                    Text("Clear", color = Color.White, fontSize = 12.sp)
-                }
-            }
-
-            Spacer(modifier = Modifier.height(6.dp))
-
-            if (logs.isEmpty()) {
-                Box(
-                    modifier = Modifier.fillMaxSize(),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Text("No events recorded yet", color = Color.Gray, fontSize = 12.sp)
-                }
-            } else {
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize()
-                ) {
-                    items(logs, key = { it.id }) { log ->
-                        val textColor = if (log.isError) Color(0xFFFF6B6B) else Color(0xFFD4D4D4)
-                        val tagColor = when (log.tag) {
-                            "WireGuard" -> Color(0xFFE91E63)
-                            "KtorServer" -> Color(0xFF64B5F6)
-                            "Socks5" -> Color(0xFF81C784)
-                            "Discovery" -> Color(0xFFFFB74D)
-                            else -> Color(0xFFBA68C8)
-                        }
-
-                        Row(modifier = Modifier.padding(vertical = 2.dp)) {
-                            Text(
-                                text = "${log.timestamp} ",
-                                color = Color(0xFF888888),
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
-                            Text(
-                                text = "[${log.tag}] ",
-                                color = tagColor,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = FontFamily.Monospace
-                            )
-                            Text(
-                                text = log.message,
-                                color = textColor,
-                                fontSize = 11.sp,
-                                fontFamily = FontFamily.Monospace
-                            )
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-private fun formatBytes(bytes: Long): String {
-    if (bytes < 1024) return "$bytes B"
-    val exp = (Math.log(bytes.toDouble()) / Math.log(1024.0)).toInt()
-    val pre = "KMGTPE"[exp - 1]
-    return String.format(Locale.US, "%.2f %sB", bytes / Math.pow(1024.0, exp.toDouble()), pre)
 }
 
 private fun hasPermission(context: Context, permission: String): Boolean =
-    androidx.core.content.ContextCompat.checkSelfPermission(context, permission) ==
-        android.content.pm.PackageManager.PERMISSION_GRANTED
-
-/** Background location only exists on Android 10+; before that, foreground location covers it. */
-private fun hasBackgroundLocationPermission(context: Context): Boolean =
-    Build.VERSION.SDK_INT < Build.VERSION_CODES.Q ||
-        hasPermission(context, Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+    ContextCompat.checkSelfPermission(context, permission) == android.content.pm.PackageManager.PERMISSION_GRANTED

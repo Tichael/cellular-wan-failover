@@ -8,6 +8,7 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -25,6 +26,7 @@ import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import com.example.cellularwanfailover.ui.theme.AppTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -72,6 +74,9 @@ class PairingActivity : ComponentActivity() {
     private var link by mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
+        // Transparent system bars whose icons follow the light/dark theme (the default left
+        // white icons on a white status bar); Scaffold pads the content clear of them
+        enableEdgeToEdge()
         super.onCreate(savedInstanceState)
         link = intent?.dataString
         val controller = FailoverController.getInstance(this)
@@ -80,7 +85,7 @@ class PairingActivity : ComponentActivity() {
         FailoverForegroundService.startService(this)
 
         setContent {
-            MaterialTheme {
+            AppTheme {
                 PairingScreen(
                     controller = controller,
                     link = link,
